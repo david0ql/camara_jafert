@@ -5,50 +5,90 @@ pensado para fotometría de polarización. Desarrollado y probado contra una
 **DCU224C** (1280x1024, sensor color, píxel de 4.65 um).
 
 Todo está en `polarcam.py`. Las dependencias van declaradas en el propio script
-(PEP 723), así que `uv` arma el entorno solo:
+(PEP 723), así que `uv` arma el entorno solo: no hay que crear venv ni instalar
+nada a mano.
+
+## Uso
+
+Sin argumentos abre un **menu interactivo** con navegacion por flechas:
 
 ```bash
 uv run polarcam.py
 ```
 
-## Uso
-
-```bash
-uv run polarcam.py                  # visor en vivo
-uv run polarcam.py --demo           # patrón sintético, sin cámara conectada
-uv run polarcam.py --self-test      # tests
-uv run polarcam.py --benchmark      # tasa de error del enlace USB
+```
+  Que queres hacer?
+> Visor en vivo         medir con el mouse
+  Serie de medidas      un punto por angulo
+  Capturar dark frame   con la tapa puesta
+  Ajustar parametros    binning, exposicion, ROI
+  Diagnostico USB       tasa de error por pixel clock
+  Salir
 ```
 
-Para tomar datos en serio, ganancia en cero y promediando:
+Con argumentos se salta el menu, para scripts:
 
 ```bash
-uv run polarcam.py -g 0 -a 8 -R 5
+uv run polarcam.py --viewer -b 4 -g 0 -a 8 -R 5
+uv run polarcam.py --demo            # sin camara conectada
+uv run polarcam.py --self-test       # tests
+uv run polarcam.py --benchmark       # tasa de error del enlace USB
 ```
 
-### Controles
+## Binning por hardware
 
-| Tecla | Acción |
-|-------|--------|
-| mouse | mide donde apunta |
-| click | fija el punto de medición, o lo suelta |
-| `+` `-` | exposición ×1.25 / ÷1.25 |
-| `[` `]` | achica o agranda el ROI |
-| `a` | promediado temporal 1 → 2 → 4 → 8 → 16 |
-| `s` | guarda la muestra en el CSV |
-| `r` | vuelve a los valores iniciales |
-| `q` / `Esc` | salir |
+El CCD suma la carga de varias filas **antes del ADC**, asi que la mejora es
+analogica y ocurre antes del ruido de lectura. Medido sobre una DCU224C a 20 ms:
 
-El recuadro del ROI se pone rojo cuando hay píxeles saturados. Un píxel
-clipeado arruina el ajuste, así que conviene bajar exposición antes de medir.
+| Modo | Alto | SNR relativo |
+|------|-----:|-------------:|
+| sin binning | 1024 | 1.00x |
+| 2x vertical | 512 | 1.62x |
+| 3x vertical | 341 | 2.22x |
+| 4x vertical | 256 | 2.34x |
 
-## De dónde salen los decimales
+Cuesta resolucion vertical, que para medir un punto no importa.
 
-Un píxel es un entero de 0 a 255 y no tiene decimales que dar. Lo que se
-reporta es el promedio sobre un parche de (2r+1)² píxeles, opcionalmente
-promediado también sobre varios frames (`-a`). Eso resuelve modulación por
-debajo de 1 LSB, que es la escala relevante cerca de la extinción, y la
-desviación estándar que acompaña a cada canal dice cuánto ruido tiene la medida.
+**Advertencia:** el sensor es Bayer y las filas alternan filtros de color, asi
+que al binear se mezclan. Con binning los canales R/G/B dejan de ser colores
+limpios. Para fuente monocromatica da igual; para polarimetria resuelta en
+color hay que usar binning 1x.
+
+## Dark frame
+
+El sensor tiene un piso de oscuridad distinto en cada canal (del orden de
+25/19/13 en la DCU224C). Ese offset es sistematico: no se va promediando y
+aplasta el contraste cerca de la extincion. El menu tiene la opcion de
+capturarlo con la tapa puesta; queda en `dark.npy` y se resta automaticamente.
+En el visor se activa y desactiva con la tecla `d`.
+
+## De dónde sale la precisión sub-nivel
+
+La primera y más eficaz ganancia **la aporta la cámara**, no el software: el
+binning suma la carga de varias filas **dentro del CCD, antes del ADC**. Es una
+operación analógica que ocurre antes del ruido de lectura, y por eso rinde más
+que cualquier procesamiento posterior. Medido sobre esta DCU224C: **2.34× de
+relación señal-ruido** con binning 4x. Eso es hardware puro.
+
+Sobre esa base, el programa suma señal en dos etapas más:
+
+| Etapa | Dónde ocurre | Ganancia |
+|-------|--------------|----------|
+| Binning | en el CCD, antes del ADC | 2.34× SNR (medido) |
+| Promedio espacial del ROI | (2r+1)² píxeles | ÷√n en el error |
+| Promedio temporal | varios frames (`-a`) | ÷√N en el error |
+
+Conviene saber qué entrega el sensor para no atribuirle de más: cada fotosito
+sale del ADC como un **entero de 0 a 255**. No hay mayor profundidad
+disponible — los modos de 10, 12 y 16 bits los rechaza con
+`IS_INVALID_COLOR_FORMAT`, verificado sobre la cámara. Ningún ADC entrega
+fracciones; los decimales aparecen al sumar señal, que es el procedimiento
+estándar en fotometría cuantitativa.
+
+Lo que importa para un ajuste es la **incertidumbre**, y el CSV la guarda: el
+error estándar de la media por canal. Con binning 4x, ROI de 11×11 y 8 frames
+baja al orden de **0.02 niveles**, es decir precisión equivalente a unos 12
+bits partiendo de un sensor de 8. Se paga en tiempo, no en resolución.
 
 ## Respuesta lineal
 
