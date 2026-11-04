@@ -16,6 +16,22 @@ entorno solo: no hay que crear venv ni instalar nada a mano.
 
 ---
 
+# Aplicaciones para Windows
+
+Los ejecutables ya compilados están en [`dist/`](dist/), listos para usar sin
+instalar Python ni `uv`:
+
+| Programa | Archivo |
+|---|---|
+| Cámara | [`dist/camara.exe`](dist/camara.exe) |
+| Polarímetro | [`dist/polarimetro.exe`](dist/polarimetro.exe) |
+
+Doble click abre la interfaz; con `--demo` funcionan sin cámara. Para usar una
+cámara real hace falta instalar antes el driver **DCx Camera Support** de
+Thorlabs: pasos en [`drivers/LEEME.md`](drivers/LEEME.md).
+
+---
+
 # Tutorial
 
 Las capturas de esta sección están tomadas en **modo demo** (`--demo`, patrón
