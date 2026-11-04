@@ -27,8 +27,10 @@ instalar Python ni `uv`:
 | Polarímetro | [`dist/polarimetro.exe`](dist/polarimetro.exe) |
 
 Doble click abre la interfaz; con `--demo` funcionan sin cámara. Para usar una
-cámara real hace falta instalar antes el driver **DCx Camera Support** de
-Thorlabs: pasos en [`drivers/LEEME.md`](drivers/LEEME.md).
+cámara real hace falta el driver USB de Thorlabs DCx, que va incluido en
+[`drivers/`](drivers/): ejecutar
+[`drivers/Instalar_driver.bat`](drivers/Instalar_driver.bat) como administrador
+y conectar la cámara. Detalles y licencia en [`drivers/LEEME.md`](drivers/LEEME.md).
 
 ---
 
