@@ -1,7 +1,9 @@
 # camara-jafert
 
-Dos programas para cámaras Thorlabs DCx, probados contra una **DCU224C**
-(1280x1024, sensor color, píxel de 4.65 um):
+Dos programas para cámaras **Thorlabs DCx** e **IDS uEye**, probados contra una
+Thorlabs DCU224C (1280x1024, CCD color, píxel de 4.65 um) y una IDS uEye C1280R12C
+(1280x1024, CMOS color, píxel de 5.20 um). Detectan solos qué cámara hay conectada
+y con qué driver hablarle:
 
 | | Archivo | Ejecutable | Para qué |
 |---|---|---|---|
@@ -27,10 +29,15 @@ instalar Python ni `uv`:
 | Polarímetro | [`dist/polarimetro.exe`](dist/polarimetro.exe) |
 
 Doble click abre la interfaz; con `--demo` funcionan sin cámara. Para usar una
-cámara real hace falta el driver USB de Thorlabs DCx, que va incluido en
-[`drivers/`](drivers/): ejecutar
-[`drivers/Instalar_driver.bat`](drivers/Instalar_driver.bat) como administrador
-y conectar la cámara. Detalles y licencia en [`drivers/LEEME.md`](drivers/LEEME.md).
+cámara real hace falta un driver USB; cualquiera de los dos sirve para ambas marcas.
+Ejecutar uno de estos como administrador y conectar la cámara:
+
+| Driver | Instalador | Requisito |
+|---|---|---|
+| Thorlabs DCx | [`drivers/Instalar_driver_ThorCam.bat`](drivers/Instalar_driver_ThorCam.bat) | ninguno, el driver va incluido |
+| IDS uEye | [`drivers/Instalar_driver_uEye.bat`](drivers/Instalar_driver_uEye.bat) | tener instalado el SDK de IDS |
+
+Detalles y licencia en [`drivers/LEEME.md`](drivers/LEEME.md).
 
 ---
 
@@ -44,9 +51,11 @@ con doble click en `camara.exe` o `polarimetro.exe` (o `uv run camara.py` /
 
 ## Cómo usar el software de la cámara
 
-1. **Abrir el programa.** Si la cámara estaba apagada al abrirlo, enchúfala y
-   pulsa **Detectar cámara ThorCam** (panel *Cámara*): engancha la primera
-   cámara libre sin reiniciar. Sin cámara el programa ofrece seguir en demo.
+1. **Abrir el programa.** Detecta la cámara, muestra su tipo en el panel *Cámara*
+   (`Tipo: IDS uEye` o `Tipo: Thorlabs`, con modelo, serie y driver) y prende el
+   visor. Si estaba apagada al abrirlo, enchúfala y pulsa **Detectar camara
+   (Thorlabs/uEye)**: engancha la primera cámara libre sin reiniciar. Sin cámara el
+   programa ofrece seguir en demo.
 
    ![Ventana inicial de la cámara](docs/camara_01_inicio.png)
 
@@ -189,18 +198,67 @@ los picos angostos, que son justo lo que uno busca en un perfil.
 Los botones de guardado y de medida **se habilitan al iniciar el visor en
 vivo**, que es cuando existe un frame promediado para escribir.
 
-**Detectar camara ThorCam** enumera las cámaras DCx conectadas (`is_GetNumberOfCameras`
-/ `is_GetCameraList`) y engancha la primera libre, mostrando modelo y número de
-serie. Sirve para el caso habitual de haber abierto el programa antes de
-prender la cámara, o haber cambiado de puerto: no hace falta reiniciar. Si el
-SDK responde pero no hay nada enchufado, lo dice; si falta el SDK, explica eso
-en vez de fallar en silencio.
+## Detección de la cámara
+
+Las DCx de Thorlabs son uEye de IDS con otra marca: comparten identificador USB
+(`VID_1409`), API y constantes. Por eso el driver no dice la marca: una uEye enlazada
+al driver de Thorlabs solo aparece por `uc480_64.dll`. El programa pregunta por las
+dos DLL y le lee la marca a la propia cámara:
+
+| Evidencia, de más a menos fuerte | Ejemplo |
+|---|---|
+| Fabricante grabado en la cámara (`is_GetCameraInfo`) | `IDS GmbH` → IDS uEye |
+| Prefijo comercial del modelo | `DCU224C` → Thorlabs, `UI-1540` → IDS |
+| Driver uEye (uc480 no prueba nada, también toma cámaras IDS) | `uEye_api_64` → IDS |
+
+`uc480_64.dll` y `uEye_api_64.dll` **no pueden convivir en un proceso**: la segunda
+falla al cargar con `WinError 1114`. Se carga una a la vez, así que **Detectar** cierra
+primero la cámara propia. También sirve para el caso habitual de haber abierto el
+programa antes de prender la cámara, o haber cambiado de puerto. Si ninguna responde,
+le pregunta a Windows y distingue "no hay nada en el USB" de "la cámara no arrancó"
+(código 43), que el SDK no sabe diferenciar.
+
+```bash
+uv run camara.py --detectar        # lista lo conectado, sin abrir la GUI
+uv run camara.py --driver ueye     # fuerza un driver: auto (por defecto), uc480 o ueye
+```
+
+## Ajustes de cámara
+
+**Ajustes de cámara...** abre las mismas pestañas de *Camera Settings* de ThorCam, en
+los dos programas. Lo que la cámara no declara sale desactivado:
+
+| Pestaña | Contiene |
+|---|---|
+| Cámara | pixel clock, cuadros por segundo y exposición (mantener, máximo, automática, larga), cuadros perdidos |
+| Imagen | ganancia master, gain boost, nivel de negro, ganancias R/G/B, balance de blancos, gamma |
+| Mejora de imagen | realce de bordes, saturación U/V |
+| Binning/Submuestreo | factores horizontal y vertical, espejo |
+| Obturador | modo de obturador, modo logarítmico |
+| Trigger | software o flanco, tiempo de espera, retardo, estado de la entrada |
+| Entrada/Salida | flash (modo, retardo, duración), PWM, GPIO 1 y 2 |
+
+Abajo: **Guardar/Cargar perfil** (JSON, se puede pasar entre cámaras: lo que una no
+tiene se salta) y **Restablecer todo**, que vuelve a la cadena lineal.
+
+Los ajustes se aplican en vivo. La interfaz **avisa en rojo mientras se esté fuera de
+la cadena lineal** (gamma, modos automáticos, realce, saturación...), porque ahí Malus
+y Stokes dejan de valer. Las ganancias manuales no avisan: multiplicar por una
+constante sigue siendo lineal. En el polarímetro, además, cambiar un ajuste con la
+serie empezada pide repetirla.
+
+Diferencias con ThorCam, a propósito: la ganancia master de la C1280R12C sale
+desactivada (ThorCam muestra un control que no hace nada: el SDK acepta el valor y la
+lectura sigue en 0), y al abrir se aplica la cadena lineal en vez de los últimos
+valores que haya dejado ThorCam.
+
+## Otros modos
 
 El menú de texto viejo sigue disponible, y también el visor de OpenCV:
 
 ```bash
 uv run camara.py --menu            # menu interactivo en la terminal
-uv run camara.py --viewer -b 4 -a 8 -R 5   # visor de OpenCV, sin la GUI
+uv run camara.py --viewer -a 8 -R 5   # visor de OpenCV, sin la GUI
 uv run camara.py --demo            # sin camara conectada (abre la GUI)
 uv run camara.py --self-test       # tests
 uv run camara.py --benchmark       # tasa de error del enlace USB
@@ -225,6 +283,10 @@ En el visor de OpenCV (`--viewer`) la tecla `c` hace el mismo guardado rápido,
 escribiendo los dos formatos con timestamp.
 
 ## Binning por hardware
+
+Lo que admite cada cámara se le pregunta a ella: la DCU224C ofrece 2x, 3x y 4x
+vertical; la C1280R12C no tiene binning, pero sí submuestreo 2x, 4x y 8x (que descarta
+píxeles en vez de sumarlos: da velocidad, no SNR).
 
 El CCD suma la carga de varias filas **antes del ADC**, asi que la mejora es
 analogica y ocurre antes del ruido de lectura. Medido sobre una DCU224C a 20 ms:
@@ -286,15 +348,22 @@ color, gain boost y compensación de negro. Cualquiera de esas etapas rompe la
 proporcionalidad entre señal e intensidad incidente y deforma una curva de
 Malus. Por el mismo motivo conviene subir exposición antes que ganancia.
 
-El sensor tiene un piso de oscuridad de unos 19 niveles, distinto por canal
+La DCU224C tiene un piso de oscuridad de unos 19 niveles, distinto por canal
 (R 25, G 19, B 13 con la tapa puesta). Para medidas absolutas hay que capturar
 un dark frame y restarlo.
 
+**La uEye C1280R12C es distinta:** con el nivel de negro en 0, su piso queda bajo el
+ADC en R y B, que dan exactamente 0 a oscuras (G da 6). Una señal débil en esos canales
+se pierde y restar el dark no la recupera; el programa lo avisa debajo de la lectura.
+Se arregla subiendo **Nivel de negro** en *Ajustes > Imagen*: suma una constante, así
+que no rompe la linealidad. Con 50, a oscuras se mide R 3.1, G 9.0, B 3.1. El dark
+frame hay que capturarlo con ese mismo valor. Conviene guardarlo en un perfil.
+
 ## Plataformas
 
-La captura necesita el SDK **DCx Camera Support** de Thorlabs, que existe para
-Windows y Linux/amd64 únicamente. **No hay driver para macOS**, ni de Thorlabs
-ni de IDS, que es el fabricante original de estas cámaras.
+La captura necesita el SDK **DCx Camera Support** de Thorlabs o el de **IDS uEye**,
+que existen para Windows y Linux/amd64 únicamente. **No hay driver para macOS**, ni de
+Thorlabs ni de IDS, que es el fabricante original de estas cámaras.
 
 | | Captura | Demo, tests y análisis |
 |---|---|---|
@@ -342,9 +411,8 @@ Dos detalles del empaquetado:
   propio archivo fuente, y PyInstaller no lo deja en disco a menos que se
   declare explícitamente como dato.
 
-La captura real (`UC480Camera`) sigue necesitando el SDK **DCx Camera
-Support** de Thorlabs instalado en esa maquina — el `.exe` no lo embebe, igual
-que no lo instala `uv run`.
+La captura real sigue necesitando el SDK de Thorlabs o de IDS instalado en esa
+maquina — el `.exe` no lo embebe, igual que no lo instala `uv run`.
 
 ## Nota sobre el enlace USB
 

@@ -6,7 +6,7 @@
 #     "pytest>=8.0",
 # ]
 # ///
-"""Polarimetro de imagen para camaras Thorlabs DCx.
+"""Polarimetro de imagen para camaras Thorlabs DCx e IDS uEye.
 
 Arma la imagen de polarizacion pixel a pixel midiendo los cuatro parametros de
 Stokes con el metodo clasico de Goldstein, "Polarized Light", cap. 6
@@ -50,9 +50,11 @@ from pathlib import Path
 
 import numpy as np
 
-from camara import (CYBER, Camera, Config, FORMATOS, UC480Error, _aplicar_estilo,
-                    _ppm, apply_dark, load_dark, open_camera, panel_con_scroll,
-                    save_frame_as)
+from camara import (CYBER, TEXTO_DETECTAR, CapturaCancelada, Camera, ColaAjustes, Config,
+                    DRIVERS, FORMATOS, UC480Error, _aplicar_estilo, _ppm, abrir_ajustes,
+                    apply_dark, avisos_no_lineales, describir_camara, detectar_camaras,
+                    diagnostico_usb, ficha_camara, load_dark, open_camera,
+                    panel_con_scroll, procesar_ajustes, save_frame_as)
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,11 @@ PASOS_ESTATICO = (
     Paso(3, "fuera", 90.0, "I3 = (S0 - S1)/2"),
     Paso(4, "puesto, eje rapido a 0 deg", 45.0, "I4 = (S0 + S3)/2"),
 )
+
+
+def serie_compatible(foto: np.ndarray, previas: list[np.ndarray]) -> bool:
+    """Las cuatro fotos de una serie se restan pixel a pixel: deben medir lo mismo."""
+    return all(foto.shape == m.shape for m in previas)
 
 
 def intensidad_teorica(stokes, theta_deg: float, phi_deg: float) -> np.ndarray:
@@ -269,6 +276,8 @@ class PolarimetroGUI:
         self.lock = threading.Lock()
         self.hilo: threading.Thread | None = None
         self.corriendo = threading.Event()
+        self.cola = ColaAjustes()
+        self.win_ajustes = None
         self.medidas: dict[int, np.ndarray] = {}
         self.paso_actual = 0
         self.params: dict[str, np.ndarray] | None = None
@@ -367,6 +376,12 @@ class PolarimetroGUI:
         self.lbl_cam = ttk.Label(f, text="...", font=("Consolas", 9), justify="left",
                                  wraplength=280)
         self.lbl_cam.pack(anchor="w")
+        self.lbl_aviso = ttk.Label(f, text="", font=("Consolas", 8), justify="left",
+                                   wraplength=280, foreground=CYBER["alerta"])
+        self.lbl_aviso.pack(anchor="w")
+        ttk.Button(f, text=TEXTO_DETECTAR, command=self.detectar).pack(fill="x", pady=(6, 0))
+        ttk.Button(f, text="Ajustes de camara...",
+                   command=lambda: abrir_ajustes(self.root, self)).pack(fill="x", pady=(4, 0))
         fila = ttk.Frame(f)
         fila.pack(fill="x", pady=(6, 0))
         self.btn_iniciar = ttk.Button(fila, text="Iniciar visor", style="Neon.TButton",
@@ -460,6 +475,8 @@ class PolarimetroGUI:
 
         if self.cam is None:
             self._abrir_camara()
+        else:                  # se volvio del menu: los widgets de la ficha son nuevos
+            self._actualizar_ficha()
         self._refrescar_paso()
         self._refrescar_modos()
         self._tick()
@@ -478,22 +495,74 @@ class PolarimetroGUI:
             from dataclasses import replace
             self.cfg = replace(self.cfg, demo=True)
             self.cam = open_camera(self.cfg)
+        self.root.title(f"Polarimetro - {self.cam.marca} {self.cam.model}")
+        self._actualizar_ficha()
+
+    def _actualizar_ficha(self) -> None:
+        cam = self.cam
+        if cam is None:
+            return
         self.lbl_cam.config(
-            text=("[DEMO] " if self.cfg.demo else "")
-                 + f"{getattr(self.cam, 'model', '?')}  "
-                   f"{self.cam.width}x{self.cam.height}\n"
-                   f"exp {self.cam.exposure_ms:.2f} ms",
-            foreground=CYBER["neon2"] if self.cfg.demo else CYBER["texto"])
+            text=f"{ficha_camara(cam)}\n{cam.width}x{cam.height}   "
+                 f"exp {cam.exposure_ms:.2f} ms",
+            foreground=CYBER["neon2"] if self.cfg.demo else CYBER["ok"])
+        avisos = avisos_no_lineales(cam.valores)
+        # Stokes se calcula con diferencias de intensidad: sin linealidad no sirve.
+        self.lbl_aviso.config(text="Fuera de la cadena lineal, los Stokes no valen: "
+                                   + ", ".join(avisos) if avisos else "")
+
+    def ajuste_aplicado(self, clave: str, res) -> None:
+        """El hilo de captura aplico un ajuste: se refresca la ficha."""
+        self._actualizar_ficha()
+        if isinstance(res, Exception):
+            self.lbl_aviso.config(text=str(res))
+        elif self.medidas and self.paso_actual < len(PASOS_ESTATICO):
+            # Las cuatro fotos tienen que salir de la misma cadena de imagen.
+            self.lbl_aviso.config(text="Cambiaste un ajuste con la serie empezada: "
+                                       "repite las medidas ya tomadas.")
+
+    def detectar(self) -> None:
+        """Vuelve a buscar camaras de las dos marcas y engancha la que haya.
+
+        La camara propia se cierra primero: abierta, retiene su DLL y la de la
+        otra marca no se podria ni cargar.
+        """
+        from dataclasses import replace
+        from tkinter import messagebox
+        self.detener()
+        if self.cam is not None:
+            self.cam.close()
+            self.cam = None
+        try:
+            camaras = detectar_camaras(self.cfg.driver)
+        except UC480Error as e:
+            messagebox.showerror("Deteccion", str(e))
+            camaras = []
+        else:
+            if not camaras:
+                pista = diagnostico_usb()
+                messagebox.showwarning("Deteccion", "Ninguna camara Thorlabs ni uEye responde."
+                                       + (f"\n\n{pista}" if pista else ""))
+        if camaras:
+            self.cfg = replace(self.cfg, demo=False)
+        self._abrir_camara()
+        if camaras and self.cam is not None and not self.cfg.demo:
+            messagebox.showinfo("Deteccion", "Conectada:\n" + "\n".join(
+                f"  - {describir_camara(c)}" for c in camaras))
+        self.iniciar()
 
     def iniciar(self) -> None:
         if self.cam is None or self.corriendo.is_set():
             return
+        self.cam.reanudar()
         self.corriendo.set()
         self.hilo = self.threading.Thread(target=self._bucle, daemon=True)
         self.hilo.start()
 
     def detener(self) -> None:
         self.corriendo.clear()
+        if self.cam is not None:
+            self.cam.cancelar()         # por si esta esperando un trigger externo
         hilo, self.hilo = self.hilo, None
         if hilo is not None:
             hilo.join(timeout=5.0)
@@ -503,12 +572,15 @@ class PolarimetroGUI:
             cam, cfg = self.cam, self.cfg
             if cam is None:
                 return
+            self.cola.drenar(cam)
             pila = []
             for _ in range(cfg.average):
                 if not self.corriendo.is_set():
                     return
                 try:
                     pila.append(cam.grab().astype(np.float64))
+                except CapturaCancelada:
+                    return
                 except UC480Error:
                     pass
             if not pila:
@@ -556,7 +628,15 @@ class PolarimetroGUI:
         paso = PASOS_ESTATICO[self.paso_actual]
         # Se guarda la intensidad escalar: los Stokes se definen sobre la
         # potencia total, no sobre cada canal de color por separado.
-        self.medidas[paso.n] = f.mean(axis=2) if f.ndim == 3 else f
+        intensidad = f.mean(axis=2) if f.ndim == 3 else f
+        previas = [m for n, m in self.medidas.items() if n != paso.n]
+        if not serie_compatible(intensidad, previas):
+            messagebox.showerror(
+                "Tamano distinto",
+                "Esta foto no tiene el tamano de las anteriores: cambio el binning o "
+                "el submuestreo. Vuelve a ese ajuste o repite la serie.")
+            return
+        self.medidas[paso.n] = intensidad
         if self.paso_actual < len(PASOS_ESTATICO) - 1:
             self.paso_actual += 1
         self._recalcular()
@@ -757,6 +837,7 @@ class PolarimetroGUI:
                 cv2.drawMarker(mapa, self.pixel_sel, (255, 255, 255),
                                cv2.MARKER_CROSS, max(8, mapa.shape[1] // 40), 1)
             self._pintar(self.canvas_pol, mapa, "_pol_id")
+        procesar_ajustes(self)
         self._tick_id = self.root.after(self.INTERVALO_MS, self._tick)
 
     def _pintar(self, canvas, bgr: np.ndarray, attr: str) -> None:
@@ -830,8 +911,10 @@ def main(argv: list[str] | None = None) -> int:
 
     argv = sys.argv[1:] if argv is None else argv
     p = argparse.ArgumentParser(
-        description="Polarimetro de imagen para camaras Thorlabs DCx.")
+        description="Polarimetro de imagen para camaras Thorlabs DCx e IDS uEye.")
     p.add_argument("--demo", action="store_true", help="patron sintetico, sin hardware")
+    p.add_argument("--driver", default="auto", choices=["auto", *sorted(DRIVERS)],
+                   help="con que driver abrir; auto prueba los dos")
     p.add_argument("-a", "--average", type=int, default=4,
                    help="frames promediados por medida")
     p.add_argument("--self-test", action="store_true", help="corre los tests y sale")
@@ -843,11 +926,18 @@ def main(argv: list[str] | None = None) -> int:
                 if getattr(sys, "frozen", False) else __file__)
         return pytest.main(["-q", "--no-header", ruta])
 
-    return run_gui(Config(demo=args.demo, average=args.average))
+    return run_gui(Config(demo=args.demo, average=args.average, driver=args.driver))
 
 
 # --- tests ---------------------------------------------------------------
 # Corren sin camara: `uv run polarimetro.py --self-test`
+
+def test_serie_no_mezcla_fotos_de_distinto_tamano():
+    grande, chica = np.zeros((1024, 1280)), np.zeros((512, 640))
+    assert serie_compatible(grande, [])
+    assert serie_compatible(grande, [np.ones((1024, 1280))])
+    assert not serie_compatible(chica, [grande])
+
 
 # Estados de referencia, Goldstein cap. 5. (S0, S1, S2, S3) normalizados.
 ESTADOS = {

@@ -1,0 +1,2 @@
+# Los .bat se guardan tal cual con CRLF: con LF, cmd.exe puede fallar al saltar a etiquetas.
+*.bat -text

@@ -1,7 +1,7 @@
 [project]
 name = "camara-jafert"
 version = "0.1.0"
-description = "Software de cámara y polarímetro de imagen para Thorlabs DCx (DCU224C)"
+description = "Software de cámara y polarímetro de imagen para Thorlabs DCx e IDS uEye"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

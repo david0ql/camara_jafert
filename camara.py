@@ -8,16 +8,24 @@
 #     "pytest>=8.0",
 # ]
 # ///
-"""Visor y fotometro RGB para camaras Thorlabs DCx.
+"""Visor y fotometro RGB para camaras Thorlabs DCx e IDS uEye.
 
 Software de camara: visor en vivo, lectura RGB con decimales, perfiles de
-intensidad, dark frame y guardado de imagenes. Probado sobre una DCU224C
-(1280x1024, CCD color, 4.65 um/px, 8 bits).
+intensidad, dark frame, guardado de imagenes y los ajustes de camara de ThorCam.
+Probado sobre una Thorlabs DCU224C (1280x1024, CCD color, 4.65 um/px, 8 bits) y
+una IDS uEye C1280R12C (1280x1024, CMOS color rolling, 5.20 um/px, 8 bits).
 
-La cadena de imagen se fuerza a respuesta lineal: gamma 1.0, sin auto-ganancia,
-auto-exposicion ni balance de blancos, y sin correccion de color. Cualquiera de
-esas etapas rompe la proporcionalidad entre señal e intensidad incidente, que es
-lo que hace cuantitativa a una medida de fotometria.
+Las DCx son uEye con otra marca: uc480_64.dll y uEye_api_64.dll exportan la misma
+API C con las mismas constantes, asi que un solo binding sirve para las dos. Lo
+que cambia es que driver tiene Windows enlazado a la camara, y eso no depende de
+la marca: una uEye enlazada al driver uc480 solo aparece por uc480_64.dll. Por
+eso se enumeran las dos DLL y la marca se lee de la propia camara.
+
+Al abrir, la cadena de imagen se fuerza a respuesta lineal: gamma 1.0, sin
+auto-ganancia, auto-exposicion ni balance de blancos, y sin correccion de color.
+Cualquiera de esas etapas rompe la proporcionalidad entre señal e intensidad
+incidente, que es lo que hace cuantitativa a una medida de fotometria. La ventana
+de ajustes permite salir de ahi, y la interfaz avisa mientras se este fuera.
 
     uv run camara.py                 interfaz grafica
     uv run camara.py --viewer        visor de OpenCV por linea de comandos
@@ -39,7 +47,9 @@ from __future__ import annotations
 import argparse
 import csv
 import ctypes as C
+import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -54,9 +64,11 @@ import numpy as np
 # el analisis, el modo demo y los tests corren tambien en macOS o Linux.
 WORD, DWORD, BOOL = C.c_uint16, C.c_uint32, C.c_int32
 
-# Constantes de uc480.h v4.20, del SDK "DCx Camera Support".
+# Constantes de uc480.h (DCx Camera Support) y uEye.h (IDS): coinciden en ambos.
 IS_SUCCESS = 0
 IS_WAIT = 0x0001
+IS_TIMED_OUT = 122
+IS_NOT_SUPPORTED = 155
 IS_TRANSFER_ERROR = 178
 IS_IGNORE_PARAMETER = -1
 IS_CM_BGR8_PACKED = 1
@@ -74,21 +86,78 @@ IS_EXPOSURE_CMD_RANGE_MIN = 3
 IS_EXPOSURE_CMD_RANGE_MAX = 4
 IS_EXPOSURE_CMD_GET = 7
 IS_EXPOSURE_CMD_SET = 12
+IS_EXPOSURE_CMD_CAPS = 1
+IS_EXPOSURE_CMD_INC = 5
+IS_EXPOSURE_CMD_LARGA_RANGO = 16
+IS_EXPOSURE_CMD_LARGA_SET = 18
+IS_EXPOSURE_CAP_LARGA = 0x4
+IS_PIXELCLOCK_CMD_RANGO = 3
+IS_GET_RGB = (0x8001, 0x8002, 0x8003)
+IS_GET_DEFAULT_RGB = (0x8005, 0x8006, 0x8007)
+IS_GET_MASTER_GAIN = 0x8000
+IS_GET_SUPPORTED = 0x8001        # binning y submuestreo: mascara de lo que admite
+IS_GET_SUPPORTED_GAINBOOST = 0x0002
+IS_SET_GAINBOOST_ON = 0x0001
+IS_GET_BL_SUPPORTED_MODE = 0x8004
+IS_BL_COMPENSATION_ENABLE = 1
+IS_BL_COMPENSATION_OFFSET = 32
+IS_GET_HW_SUPPORTED_GAMMA = 0x8001
+IS_SET_HW_GAMMA_ON = 0x0001
+IS_SET_ROP_MIRROR_UPDOWN = 8
+IS_SET_ROP_MIRROR_LEFTRIGHT = 64
+IS_AOI_IMAGE_GET_AOI = 2
+IS_EDGE_RANGO, IS_EDGE_SET = 1, 4
+IS_SET_ENABLE_AUTO_GAIN = 0x8800
+IS_SET_ENABLE_AUTO_SHUTTER = 0x8802
+IS_SET_ENABLE_AUTO_WB = 0x8804
+IS_SET_TRIGGER_OFF = 0x0000
+IS_GET_TRIGGER_STATUS = 0x8001
+IS_GET_MIN_TRIGGER_DELAY, IS_GET_MAX_TRIGGER_DELAY = 0x8001, 0x8002
+IS_FEATURE_GET, IS_SHUTTER_SET = 1, 6
+IS_LOG_MODO_SET, IS_LOG_VALOR_RANGO, IS_LOG_VALOR_SET = 13, 15, 17
+IS_LOG_GAIN_RANGO, IS_LOG_GAIN_SET = 19, 21
+IS_FEATURE_LOG = 0x20
+IS_IO_FLASH_MIN, IS_IO_FLASH_MAX, IS_IO_FLASH_SET_PARAMS = 14, 15, 18
+IS_IO_FLASH_SET_MODO = 20
+IS_IO_GPIOS_SOPORTADOS, IS_IO_GPIO_SET = 1, 30
+IS_IO_PWM_GPIOS, IS_IO_PWM_MIN, IS_IO_PWM_MAX, IS_IO_PWM_SET = 21, 22, 23, 26
 
 # is_SetAutoParameter: todos van a 0.0 para dejar el sensor en manual.
 AUTO_PARAMS = (0x8800, 0x8802, 0x8804, 0x8806)  # ganancia, shutter, WB, framerate
 
-# Solo binning vertical: es lo unico que declara la DCU224C (mascara 0x0015).
+# Binning vertical del arranque por CLI (Config.binning). Lo que admite de verdad
+# cada camara se lee de su mascara: la DCU224C declara 0x0015 y la uEye C1280R12C
+# no admite ninguno.
 BINNING_MODES = {1: 0x00, 2: 0x0001, 3: 0x0010, 4: 0x0004}
 
 # SNR medido sobre una DCU224C a 20 ms, relativo a sin binning.
 BINNING_SNR = {1: 1.00, 2: 1.62, 3: 2.22, 4: 2.34}
 
+# Bit de cada factor en las mascaras de is_SetBinning e is_SetSubSampling.
+FACTORES_V = {2: 0x0001, 3: 0x0010, 4: 0x0004, 5: 0x0040, 6: 0x0100, 8: 0x0400, 16: 0x1000}
+FACTORES_H = {2: 0x0002, 3: 0x0020, 4: 0x0008, 5: 0x0080, 6: 0x0200, 8: 0x0800, 16: 0x2000}
+
 PIXEL_CLOCKS = (12, 16, 20, 24, 30)  # MHz, los que barre el diagnostico USB
+
+# Las dos APIs exportan las mismas funciones; solo cambia que DLL se carga.
+DRIVERS = {
+    "uc480": {"dll": "uc480_64", "dll32": "uc480",
+              "sdk": "DCx Camera Support (Thorlabs)"},
+    "ueye": {"dll": "uEye_api_64", "dll32": "uEye_api",
+             "sdk": "IDS Software Suite (uEye)"},
+}
 
 
 class UC480Error(RuntimeError):
     pass
+
+
+class TriggerTimeout(UC480Error):
+    """Paso el tiempo de espera del trigger sin que llegara ningun pulso."""
+
+
+class CapturaCancelada(UC480Error):
+    """Se detuvo el visor mientras una captura esperaba un trigger."""
 
 
 @dataclass(frozen=True)
@@ -96,6 +165,8 @@ class Config:
     exposure_ms: float = 20.0
     gain: int = 0                 # ganancia master del hardware, 0..100
     binning: int = 1              # 1 = sin binning; 2, 3 o 4 = vertical
+    driver: str = "auto"          # auto, uc480 (Thorlabs) o ueye (IDS)
+    camera_id: int = 0            # 0 toma la primera camara libre
     pixel_clock: int = 0          # MHz; 0 deja el valor por defecto del driver
     fps: float = 0.0              # 0 pide el maximo que permita el pixel clock
     retries: int = 8              # reintentos ante IS_TRANSFER_ERROR
@@ -123,10 +194,16 @@ class Config:
             raise ValueError("gain debe estar entre 0 y 100")
         if self.binning not in BINNING_MODES:
             raise ValueError(f"binning debe ser uno de {sorted(BINNING_MODES)}")
-        if self.pixel_clock and not 5 <= self.pixel_clock <= 30:
-            raise ValueError("pixel_clock debe estar entre 5 y 30 MHz, o 0")
+        # Cota amplia a proposito: el rango real lo declara cada camara (5-30 en
+        # la DCU224C, 5-43 en la C1280R12C) y el SDK rechaza lo que no admite.
+        if self.pixel_clock and not 1 <= self.pixel_clock <= 500:
+            raise ValueError("pixel_clock debe estar entre 1 y 500 MHz, o 0")
         if self.retries < 0:
             raise ValueError("retries debe ser >= 0")
+        if self.driver != "auto" and self.driver not in DRIVERS:
+            raise ValueError(f"driver debe ser auto o uno de {sorted(DRIVERS)}")
+        if self.camera_id < 0:
+            raise ValueError("camera_id debe ser >= 0")
 
 
 @dataclass(frozen=True)
@@ -177,6 +254,17 @@ def sample_patch(frame_bgr: np.ndarray, x: int, y: int, radius: int,
     )
 
 
+def canales_recortados(s: Sample) -> list[str]:
+    """Canales cuyo parche entero quedo en 0: la señal cae por debajo del ADC.
+
+    Pasa en sensores cuyo piso de oscuridad queda bajo cero con el nivel de negro
+    en 0: la C1280R12C recorta R y B (la DCU224C no, su piso es 25/19/13). Ahi una
+    señal debil se pierde y restar el dark no la recupera. Se arregla subiendo el
+    nivel de negro, que suma una constante, y midiendo el dark con ese mismo valor.
+    """
+    return [n for n, m, sd in zip("RGB", s.mean, s.std) if m == 0.0 and sd == 0.0]
+
+
 def format_sample(s: Sample, decimals: int, normalize: bool) -> list[str]:
     k = 1.0 / 255.0 if normalize else 1.0
     unit = "" if normalize else "/255"
@@ -198,20 +286,56 @@ class Camera(Protocol):
     def grab(self) -> np.ndarray: ...
     def set_exposure(self, ms: float) -> float: ...
     def exposure_range(self) -> tuple[float, float]: ...
+    def ajustes(self) -> dict: ...
+    def aplicar_ajuste(self, clave: str, valor): ...
+    def restablecer(self) -> list[str]: ...
     def close(self) -> None: ...
 
 
-def _cargar_dll():
-    """Carga uc480_64.dll. La comparten la deteccion y la captura."""
+# uc480_64.dll y uEye_api_64.dll no pueden convivir en un proceso: la segunda en
+# cargarse falla con WinError 1114 en su DllMain, sea cual sea el orden. Por eso
+# hay una sola DLL viva a la vez y se libera antes de cambiar a la otra, lo que
+# solo es posible si ninguna camara la esta usando.
+_dll_lock = threading.RLock()
+_dll_activa: tuple[str, object] | None = None
+_camaras_abiertas = 0
+
+
+def _liberar_dll() -> None:
+    global _dll_activa
+    if _dll_activa is None:
+        return
+    k32 = C.WinDLL("kernel32")
+    k32.FreeLibrary.argtypes = [C.c_void_p]
+    k32.FreeLibrary(_dll_activa[1]._handle)
+    _dll_activa = None
+
+
+def _cargar_dll(driver: str = "uc480"):
+    """Carga la DLL de ese driver, liberando la otra si hace falta."""
+    global _dll_activa
     if sys.platform != "win32":
         raise UC480Error(
             f"la captura solo funciona en Windows (aca: {sys.platform}). "
-            "Thorlabs publica el SDK DCx para Windows y Linux/amd64 unicamente; "
-            "no hay build para macOS. Usa el modo demo para trabajar sin camara.")
-    try:
-        return C.WinDLL("uc480_64" if sys.maxsize > 2 ** 32 else "uc480")
-    except OSError as e:
-        raise UC480Error("falta uc480_64.dll; instala 'DCx Camera Support'") from e
+            "Los SDK de Thorlabs e IDS no tienen build para macOS. "
+            "Usa el modo demo para trabajar sin camara.")
+    d = DRIVERS[driver]
+    with _dll_lock:
+        if _dll_activa is not None and _dll_activa[0] == driver:
+            return _dll_activa[1]
+        if _dll_activa is not None:
+            if _camaras_abiertas:
+                raise UC480Error(
+                    f"hay una camara abierta con el driver {_dll_activa[0]}; "
+                    "cierrala antes de usar el otro driver")
+            _liberar_dll()
+        nombre = d["dll"] if sys.maxsize > 2 ** 32 else d["dll32"]
+        try:
+            dll = C.WinDLL(nombre)
+        except OSError as e:
+            raise UC480Error(f"falta {nombre}.dll; instala '{d['sdk']}'") from e
+        _dll_activa = (driver, dll)
+        return dll
 
 
 class UC480_CAMERA_INFO(C.Structure):
@@ -232,24 +356,85 @@ def _tipo_lista_camaras(n: int):
     return UC480_CAMERA_LIST
 
 
-def _info_camaras(entradas) -> list[dict]:
-    """Traduce las entradas del SDK a dicts, separado para poder testearlo."""
-    return [{"id": int(c.dwCameraID), "device": int(c.dwDeviceID),
-             "modelo": (c.FullModelName or c.Model).decode(errors="replace").strip(),
-             "serie": c.SerNo.decode(errors="replace").strip(),
-             "en_uso": bool(c.dwInUse)}
-            for c in entradas]
+class BOARDINFO(C.Structure):
+    """Identidad grabada en la camara (is_GetCameraInfo). ID trae el fabricante."""
+
+    _fields_ = [("SerNo", C.c_char * 12), ("ID", C.c_char * 20),
+                ("Version", C.c_char * 10), ("Date", C.c_char * 12),
+                ("Select", C.c_ubyte), ("Type", C.c_ubyte), ("Reserved", C.c_char * 8)]
 
 
-def detectar_camaras() -> list[dict]:
-    """Enumera las camaras DCx conectadas sin abrirlas.
+class IS_RECT(C.Structure):
+    _fields_ = [("x", C.c_int32), ("y", C.c_int32), ("w", C.c_int32), ("h", C.c_int32)]
 
-    Sirve para enganchar una camara que se conecto despues de arrancar el
-    programa, sin tener que reiniciarlo. Devuelve lista vacia si el SDK esta
-    instalado pero no hay ninguna camara enchufada; si falta el SDK o no es
-    Windows, levanta UC480Error con el motivo.
+
+class IO_FLASH_PARAMS(C.Structure):
+    _fields_ = [("s32Delay", C.c_int32), ("u32Duration", C.c_uint32)]
+
+
+class IO_PWM_PARAMS(C.Structure):
+    _fields_ = [("dblFrequency_Hz", C.c_double), ("dblDutyCycle", C.c_double)]
+
+
+class IO_GPIO_CONFIGURATION(C.Structure):
+    _fields_ = [("u32Gpio", C.c_uint32), ("u32Caps", C.c_uint32),
+                ("u32Configuration", C.c_uint32), ("u32State", C.c_uint32),
+                ("u32Reserved", C.c_uint32 * 12)]
+
+
+MARCA_THORLABS, MARCA_IDS, MARCA_DESCONOCIDA = "Thorlabs", "IDS uEye", "desconocida"
+
+
+def clasificar_marca(fabricante: str, modelo: str, driver: str) -> str:
+    """Decide que tipo de camara es, de la evidencia mas fuerte a la mas debil.
+
+    El fabricante grabado en la camara manda: una uEye enlazada al driver de
+    Thorlabs sigue diciendo "IDS GmbH". El modelo solo sirve con los prefijos
+    comerciales, porque C1280R12C o D1280G12C son codigos de sensor que no
+    distinguen marca. El driver es el ultimo recurso, y solo uEye dice algo: el
+    driver uc480 tambien toma camaras IDS, asi que no prueba que sea Thorlabs.
     """
-    dll = _cargar_dll()
+    fab, mod = fabricante.lower(), modelo.upper()
+    if "thorlabs" in fab:
+        return MARCA_THORLABS
+    if "ids" in fab.split() or fab.startswith("ids"):
+        return MARCA_IDS
+    if mod.startswith(("DCC", "DCU")):
+        return MARCA_THORLABS
+    if mod.startswith("UI"):
+        return MARCA_IDS
+    return MARCA_IDS if driver == "ueye" else MARCA_DESCONOCIDA
+
+
+def _info_camaras(entradas, driver: str = "uc480") -> list[dict]:
+    """Traduce las entradas del SDK a dicts, separado para poder testearlo."""
+    filas = []
+    for c in entradas:
+        modelo = (c.FullModelName or c.Model).decode(errors="replace").strip()
+        filas.append({"id": int(c.dwCameraID), "device": int(c.dwDeviceID),
+                      "modelo": modelo,
+                      "serie": c.SerNo.decode(errors="replace").strip(),
+                      "en_uso": bool(c.dwInUse), "driver": driver, "fabricante": "",
+                      "marca": clasificar_marca("", modelo, driver)})
+    return filas
+
+
+def _leer_fabricante(dll, camara_id: int) -> str:
+    """Abre la camara un instante para leer su fabricante; "" si no se puede."""
+    h = C.c_uint32(camara_id)
+    if dll.is_InitCamera(C.byref(h), None) != IS_SUCCESS:
+        return ""
+    try:
+        b = BOARDINFO()
+        if dll.is_GetCameraInfo(h, C.byref(b)) != IS_SUCCESS:
+            return ""
+        return b.ID.decode(errors="replace").strip()
+    finally:
+        dll.is_ExitCamera(h)
+
+
+def _enumerar(driver: str) -> list[dict]:
+    dll = _cargar_dll(driver)
     n = C.c_int()
     rc = dll.is_GetNumberOfCameras(C.byref(n))
     if rc != IS_SUCCESS:
@@ -261,25 +446,490 @@ def detectar_camaras() -> list[dict]:
     rc = dll.is_GetCameraList(C.byref(lista))
     if rc != IS_SUCCESS:
         raise UC480Error(f"is_GetCameraList devolvio rc={rc}")
-    return _info_camaras(lista.uci[:n.value])
+    camaras = _info_camaras(lista.uci[:n.value], driver)
+    for c in camaras:
+        if not c["en_uso"]:
+            c["fabricante"] = _leer_fabricante(dll, c["id"])
+            c["marca"] = clasificar_marca(c["fabricante"], c["modelo"], driver)
+    return camaras
 
 
-class UC480Camera:
-    """Acceso por ctypes a uc480_64.dll."""
+def detectar_camaras(driver: str = "auto") -> list[dict]:
+    """Enumera las camaras conectadas por los dos drivers y dice que tipo es cada una.
 
-    def __init__(self, cfg: Config):
+    Una camara libre se abre un instante, porque el fabricante solo se puede leer
+    con la camara abierta. Devuelve lista vacia si hay SDK pero ninguna camara; si
+    no hay ningun SDK o no es Windows, levanta UC480Error con el motivo.
+
+    Con una camara abierta no se puede cargar la otra DLL, asi que solo se enumera
+    el driver que esta en uso.
+    """
+    drivers = tuple(DRIVERS) if driver == "auto" else (driver,)
+    with _dll_lock:
+        if _camaras_abiertas and _dll_activa is not None:
+            drivers = (_dll_activa[0],)
+        camaras, errores = [], []
+        for d in drivers:
+            try:
+                camaras += _enumerar(d)
+            except UC480Error as e:
+                errores.append(str(e))
+    if len(errores) == len(drivers):
+        raise UC480Error("; ".join(errores))
+    return camaras
+
+
+def elegir_camara(camaras: list[dict], cfg: Config) -> dict | None:
+    """La camara que corresponde abrir segun cfg: la pedida o la primera libre."""
+    for c in camaras:
+        if cfg.driver not in ("auto", c["driver"]) or c["en_uso"]:
+            continue
+        if cfg.camera_id in (0, c["id"]):
+            return c
+    return None
+
+
+def describir_camara(c: dict) -> str:
+    """Una linea legible: tipo, modelo, serie y driver."""
+    return (f"{c['marca']} - {c['modelo'] or '?'}  s/n {c['serie'] or '?'}  "
+            f"(driver {c['driver']})" + ("  [en uso]" if c["en_uso"] else ""))
+
+
+def interpretar_pnp(lineas: list[str]) -> str:
+    """Traduce el estado USB de Windows a una pista, cuando el SDK no ve nada.
+
+    El SDK no distingue "no hay camara" de "la camara fallo al arrancar". Windows
+    si: un USB\\VID_0000&PID_0002 es un dispositivo que no respondio al pedido de
+    descriptor (codigo 43), que es como queda una camara cuyo arranque de firmware
+    fallo. Solo es una pista: puede ser otro aparato.
+    """
+    texto = "\n".join(lineas).upper()
+    if "VID_0000&PID_000" in texto:
+        return ("Windows ve un dispositivo USB que no arranco (codigo 43). Si es la "
+                "camara, desconectala unos 10 s y probala en otro puerto o con otro "
+                "cable: es un problema del enlace, no del programa.")
+    if "VID_1409" in texto:
+        return ("Windows ve una camara IDS/Thorlabs, pero el SDK no la lista. Revisa "
+                "que su driver este instalado y que otro programa no la tenga tomada.")
+    return "Windows no ve ninguna camara en el USB: revisa el cable y el puerto."
+
+
+def diagnostico_usb() -> str:
+    """Le pregunta a Windows que hay en el USB. Vacio si no se puede saber."""
+    if sys.platform != "win32":
+        return ""
+    orden = ("Get-PnpDevice -PresentOnly | Where-Object InstanceId -Match "
+             "'VID_1409|VID_0000&PID_000' | ForEach-Object InstanceId")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", orden],
+                           capture_output=True, text=True, timeout=10,
+                           stdin=subprocess.DEVNULL,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return interpretar_pnp(r.stdout.splitlines())
+
+
+# --- ajustes de camara ------------------------------------------------------
+# Las mismas pestañas que Camera Settings de ThorCam. La tabla es de datos: la
+# ventana se arma leyendola y lo que una camara no soporta sale desactivado, como
+# en ThorCam, con la diferencia de que aca se comprueba contra lo que la camara
+# declara (ThorCam muestra activa la ganancia master de la C1280R12C, que no hace
+# nada: el SDK acepta el valor y la lectura sigue en 0).
+
+@dataclass(frozen=True)
+class Ajuste:
+    """Un control de la ventana de ajustes, con el rango que admite esta camara."""
+
+    clave: str
+    pestana: str
+    grupo: str
+    etiqueta: str
+    tipo: str                     # rango, opciones, bool o accion
+    valor: object = None
+    minimo: float = 0.0
+    maximo: float = 1.0
+    paso: float = 1.0
+    opciones: tuple = ()
+    activo: bool = True
+    nota: str = ""
+
+
+P_CAMARA, P_IMAGEN, P_MEJORA = "Camara", "Imagen", "Mejora de imagen"
+P_GEOM, P_OBTURADOR, P_TRIGGER, P_IO = ("Binning/Submuestreo", "Obturador", "Trigger",
+                                        "Entrada/Salida")
+PESTANAS = (P_CAMARA, P_IMAGEN, P_MEJORA, P_GEOM, P_OBTURADOR, P_TRIGGER, P_IO)
+
+MODOS_TRIGGER = {"libre": 0x0000, "software": 0x1008, "flanco de bajada": 0x1001,
+                 "flanco de subida": 0x1002}
+MODOS_FLASH = {"apagado": 0, "constante alto": 3, "constante bajo": 4,
+               "libre activo alto": 6, "libre activo bajo": 5}
+# En el obturador, el bit de capacidad es tambien el valor que se le pasa al SDK.
+MODOS_OBTURADOR = {"global": 0x02, "global (tiempo alterno)": 0x80,
+                   "rolling": 0x01, "rolling (inicio global)": 0x40}
+MODOS_LOG = {"de fabrica (antiblooming)": 0, "apagado (sin antiblooming)": 1, "manual": 2}
+MODOS_GPIO = {"entrada": (0x01, 0), "salida baja": (0x02, 0), "salida alta": (0x02, 1),
+              "PWM": (0x08, 0), "flash": (0x04, 0)}
+
+# Lo que deja la cadena de imagen lineal. "Restablecer" vuelve aca.
+DEFECTOS = {
+    "fps_hold": True, "fps_max": False, "exp_hold": True, "exp_max": False,
+    "exp_auto": False, "exp_larga": False, "ganancia": 0, "ganancia_auto": False,
+    "gain_boost": False, "negro": 0, "negro_auto": False, "awb": False,
+    "gamma": 1.0, "gamma_sensor": False, "borde": 0, "sat_u": 100, "sat_v": 100,
+    "sat_combinar": True, "bin_h": "1x", "bin_v": "1x", "sub_h": "1x", "sub_v": "1x",
+    "espejo_lr": False, "espejo_ud": False, "log_modo": "de fabrica (antiblooming)",
+    "log_valor": 0, "log_ganancia": 0, "trigger_modo": "libre",
+    "trigger_timeout_ms": 10000, "trigger_delay_on": False, "trigger_delay_us": 0,
+    "flash_modo": "apagado", "flash_delay_us": 0, "flash_dur_us": 0,
+    "flash_auto": True, "pwm_hz": 0.0, "pwm_duty": 0.0,
+    "gpio1": "entrada", "gpio2": "entrada",
+}
+
+# Orden al cargar un perfil: cada paso reajusta el rango valido del siguiente.
+ORDEN_PERFIL = ("sub_h", "sub_v", "bin_h", "bin_v", "espejo_lr", "espejo_ud",
+                "pixel_clock", "fps_hold", "fps_max", "fps", "exp_hold", "exp_max",
+                "exp_larga", "exposicion", "exp_auto")
+# Los que cambian el tamaño de la imagen: hay que rehacer el buffer.
+CLAVES_GEOMETRIA = {"bin_h", "bin_v", "sub_h", "sub_v"}
+
+
+def opciones_de_mascara(mascara: int, factores: dict[int, int]) -> tuple[str, ...]:
+    """Los factores que declara una mascara del SDK, como opciones '1x', '2x'..."""
+    if mascara <= 0:
+        return ("1x",)
+    return ("1x", *(f"{n}x" for n, bit in sorted(factores.items()) if mascara & bit))
+
+
+def factor_de_opcion(valor) -> int:
+    """Pasa '2x' o 2 a 2."""
+    return int(str(valor).rstrip("x"))
+
+
+def avisos_no_lineales(v: dict) -> list[str]:
+    """Que ajustes activos rompen la proporcionalidad entre señal e intensidad.
+
+    Malus y Stokes suponen esa proporcionalidad, asi que no se prohibe salir de la
+    cadena lineal pero se avisa mientras dure. Las ganancias manuales no aparecen:
+    multiplicar por una constante no deja de ser lineal.
+    """
+    avisos = []
+    if abs(float(v.get("gamma", 1.0)) - 1.0) > 1e-9:
+        avisos.append(f"gamma {float(v['gamma']):.2f}")
+    for clave, texto in (("gamma_sensor", "gamma de sensor"),
+                         ("exp_auto", "exposicion automatica"),
+                         ("ganancia_auto", "ganancia automatica"),
+                         ("awb", "balance de blancos automatico"),
+                         ("negro_auto", "nivel de negro automatico"),
+                         ("gain_boost", "gain boost")):
+        if v.get(clave):
+            avisos.append(texto)
+    if v.get("borde"):
+        avisos.append("realce de bordes")
+    if int(v.get("sat_u", 100)) != 100 or int(v.get("sat_v", 100)) != 100:
+        avisos.append("saturacion de color")
+    if v.get("log_modo", DEFECTOS["log_modo"]) == "manual":
+        avisos.append("modo logaritmico")
+    return avisos
+
+
+def construir_ajustes(cap: dict, v: dict) -> dict[str, Ajuste]:
+    """Arma la tabla de ajustes a partir de lo que declara la camara y sus valores."""
+
+    filas: list[Ajuste] = []
+
+    def add(clave, pestana, grupo, etiqueta, tipo, **kw):
+        filas.append(Ajuste(clave, pestana, grupo, etiqueta, tipo, v.get(clave), **kw))
+
+    def rango(clave, pestana, grupo, etiqueta, limites, soportado=True, nota=""):
+        lo, hi, paso = limites if limites else (0, 1, 1)
+        add(clave, pestana, grupo, etiqueta, "rango", minimo=lo, maximo=hi, paso=paso,
+            activo=bool(soportado and limites and hi > lo), nota=nota)
+
+    def geom(clave, grupo, etiqueta, opciones):
+        add(clave, P_GEOM, grupo, etiqueta, "opciones", opciones=opciones,
+            activo=len(opciones) > 1)
+
+    # Camara
+    rango("pixel_clock", P_CAMARA, "Reloj", "Pixel clock (MHz)", cap.get("reloj"),
+          nota="bajarlo reduce los cuadros perdidos")
+    rango("fps", P_CAMARA, "Cuadros", "Cuadros por segundo", cap.get("fps"))
+    add("fps_hold", P_CAMARA, "Cuadros", "Mantener al cambiar el reloj", "bool")
+    add("fps_max", P_CAMARA, "Cuadros", "Maximo", "bool")
+    rango("exposicion", P_CAMARA, "Exposicion", "Exposicion (ms)", cap.get("exposicion"),
+          nota="la exposicion larga exige bajar antes los cuadros por segundo")
+    add("exp_hold", P_CAMARA, "Exposicion", "Mantener al cambiar el reloj", "bool")
+    add("exp_max", P_CAMARA, "Exposicion", "Maximo", "bool")
+    add("exp_auto", P_CAMARA, "Exposicion", "Automatica", "bool")
+    add("exp_larga", P_CAMARA, "Exposicion", "Exposicion larga", "bool",
+        activo=bool(cap.get("exp_larga")))
+    # Imagen
+    rango("ganancia", P_IMAGEN, "Ganancia", "Ganancia master", (0, 100, 1),
+          cap.get("master"), nota="" if cap.get("master") else "este sensor no la tiene")
+    add("ganancia_auto", P_IMAGEN, "Ganancia", "Automatica", "bool",
+        activo=bool(cap.get("master")))
+    add("gain_boost", P_IMAGEN, "Ganancia", "Gain boost", "bool", activo=bool(cap.get("boost")))
+    rango("negro", P_IMAGEN, "Ganancia", "Nivel de negro (offset)", (0, 255, 1),
+          cap.get("negro_offset"))
+    add("negro_auto", P_IMAGEN, "Ganancia", "Negro automatico", "bool",
+        activo=bool(cap.get("negro_auto")))
+    add("awb", P_IMAGEN, "Ganancia de color", "Balance de blancos automatico", "bool",
+        activo=bool(cap.get("rgb")))
+    for canal, texto in (("r", "Rojo"), ("g", "Verde"), ("b", "Azul")):
+        rango(f"ganancia_{canal}", P_IMAGEN, "Ganancia de color", f"Ganancia {texto.lower()}",
+              (0, 100, 1), cap.get("rgb"))
+    rango("gamma", P_IMAGEN, "Gamma", "Gamma por software", (1.0, 2.2, 0.01))
+    add("gamma_sensor", P_IMAGEN, "Gamma", "Gamma de sensor", "bool",
+        activo=bool(cap.get("gamma_sensor")))
+    # Mejora de imagen
+    rango("borde", P_MEJORA, "Realce de bordes", "Realce", cap.get("borde"))
+    rango("sat_u", P_MEJORA, "Saturacion de color", "Saturacion U", (0, 200, 1), cap.get("color"))
+    add("sat_combinar", P_MEJORA, "Saturacion de color", "Combinar U y V", "bool",
+        activo=bool(cap.get("color")))
+    rango("sat_v", P_MEJORA, "Saturacion de color", "Saturacion V", (0, 200, 1), cap.get("color"))
+    # Binning y submuestreo
+    bin_m, sub_m = cap.get("bin_mask", 0), cap.get("sub_mask", 0)
+    geom("bin_h", "Binning", "Horizontal", opciones_de_mascara(bin_m, FACTORES_H))
+    geom("bin_v", "Binning", "Vertical", opciones_de_mascara(bin_m, FACTORES_V))
+    geom("sub_h", "Submuestreo", "Horizontal", opciones_de_mascara(sub_m, FACTORES_H))
+    geom("sub_v", "Submuestreo", "Vertical", opciones_de_mascara(sub_m, FACTORES_V))
+    add("espejo_lr", P_GEOM, "Espejo", "Izquierda/derecha", "bool")
+    add("espejo_ud", P_GEOM, "Espejo", "Arriba/abajo", "bool")
+    # Obturador
+    obt = tuple(n for n, bit in MODOS_OBTURADOR.items() if cap.get("features", 0) & bit)
+    add("obturador", P_OBTURADOR, "Area", "Modo de obturador", "opciones", opciones=obt,
+        activo=len(obt) > 1)
+    log_on = bool(cap.get("features", 0) & IS_FEATURE_LOG)
+    add("log_modo", P_OBTURADOR, "Modo logaritmico", "Modo", "opciones",
+        opciones=tuple(MODOS_LOG), activo=log_on)
+    rango("log_valor", P_OBTURADOR, "Modo logaritmico", "Valor", cap.get("log_valor"), log_on)
+    rango("log_ganancia", P_OBTURADOR, "Modo logaritmico", "Ganancia", cap.get("log_ganancia"),
+          log_on)
+    # Trigger
+    add("trigger_modo", P_TRIGGER, "Modo", "Modo", "opciones", opciones=tuple(MODOS_TRIGGER))
+    rango("trigger_timeout_ms", P_TRIGGER, "Modo", "Tiempo de espera (ms)", (100, 3600000, 100))
+    add("trigger_delay_on", P_TRIGGER, "Entrada", "Retardo de trigger", "bool",
+        activo=bool(cap.get("trigger_delay")))
+    rango("trigger_delay_us", P_TRIGGER, "Entrada", "Retardo (us)", cap.get("trigger_delay"))
+    add("trigger_estado", P_TRIGGER, "Entrada", "Ver estado de la entrada", "accion")
+    # Entrada/Salida
+    add("flash_modo", P_IO, "Salida de flash", "Modo", "opciones", opciones=tuple(MODOS_FLASH),
+        activo=bool(cap.get("flash")))
+    rango("flash_delay_us", P_IO, "Salida de flash", "Retardo (us)", cap.get("flash_delay"))
+    rango("flash_dur_us", P_IO, "Salida de flash", "Duracion (us)", cap.get("flash_dur"))
+    add("flash_auto", P_IO, "Salida de flash", "Duracion automatica", "bool",
+        activo=bool(cap.get("flash")))
+    rango("pwm_hz", P_IO, "Modulacion PWM", "Frecuencia (Hz)", cap.get("pwm_hz"))
+    rango("pwm_duty", P_IO, "Modulacion PWM", "Ciclo de trabajo", cap.get("pwm_duty"))
+    gpios = cap.get("gpios", 0)
+    add("gpio1", P_IO, "GPIO", "GPIO 1", "opciones", opciones=tuple(MODOS_GPIO),
+        activo=bool(gpios & 1))
+    add("gpio2", P_IO, "GPIO", "GPIO 2", "opciones", opciones=tuple(MODOS_GPIO),
+        activo=bool(gpios & 2))
+    return {a.clave: a for a in filas}
+
+
+def valor_valido(a: Ajuste, valor):
+    """Normaliza lo que llega de la GUI o de un perfil al tipo y rango del ajuste."""
+    if a.tipo == "bool":
+        return bool(valor)
+    if a.tipo == "opciones":
+        if valor not in a.opciones:
+            raise ValueError(f"{a.etiqueta}: '{valor}' no es una opcion de esta camara")
+        return valor
+    if a.tipo == "rango":
+        x = min(max(float(valor), a.minimo), a.maximo)
+        return int(round(x)) if float(a.paso).is_integer() and float(a.minimo).is_integer() else x
+    return valor
+
+
+class AjustesMixin:
+    """Tabla de ajustes y aplicacion, comun a la camara real y a la demo.
+
+    ajustes() no llama al SDK: lee lo que quedo guardado la ultima vez. Asi el
+    hilo de Tk puede consultarla mientras la captura esta bloqueada en el DLL.
+    """
+
+    def ajustes(self) -> dict[str, Ajuste]:
+        return construir_ajustes(self.cap, self.valores)
+
+    def aplicar_ajuste(self, clave: str, valor):
+        """Aplica un ajuste y devuelve el valor que quedo de verdad en la camara."""
+        a = self.ajustes().get(clave)
+        if a is None:
+            raise ValueError(f"ajuste desconocido: {clave}")
+        if not a.activo:
+            raise UC480Error(f"esta camara no admite '{a.etiqueta}'")
+        if a.tipo == "accion":
+            return self._hw(clave, None)
+        nuevo = valor_valido(a, valor)
+        anterior = self.valores.get(clave)
+        self.valores[clave] = nuevo
+        try:
+            self._hw(clave, nuevo)
+        except UC480Error:
+            self.valores[clave] = anterior
+            raise
+        self._acoplar(clave, nuevo)
+        self._releer()
+        return self.valores.get(clave)
+
+    def _acoplar(self, clave: str, valor) -> None:
+        """Efectos entre ajustes, igual que las casillas de ThorCam."""
+        if clave in ("sat_u", "sat_v") and self.valores.get("sat_combinar"):
+            otro = "sat_v" if clave == "sat_u" else "sat_u"
+            self.valores[otro] = valor
+            self._hw(otro, valor)
+        elif clave == "sat_combinar" and valor:
+            self.valores["sat_v"] = self.valores["sat_u"]
+            self._hw("sat_v", self.valores["sat_u"])
+        elif clave == "pixel_clock":
+            self._reaplicar_tiempos()
+        elif clave == "fps":
+            self._reaplicar_exposicion()
+        elif clave == "fps_max" and valor:
+            self._reaplicar_tiempos()
+        elif clave in ("exp_max", "exp_larga"):
+            self._reaplicar_exposicion()
+
+    def restablecer(self) -> list[str]:
+        """Vuelve a la cadena lineal. Devuelve lo que no se pudo restablecer."""
+        objetivo = {**DEFECTOS, **self.defectos_camara}
+        return self.cargar_valores(objetivo)
+
+    def cargar_valores(self, valores: dict) -> list[str]:
+        """Aplica un conjunto de ajustes, en el orden que respeta sus dependencias."""
+        tabla = self.ajustes()
+        claves = [k for k in ORDEN_PERFIL if k in valores]
+        claves += [k for k in valores if k not in claves and k in tabla]
+        errores = []
+        for k in claves:
+            a = self.ajustes().get(k)
+            # Lo inactivo se salta en silencio: un perfil de otra camara puede
+            # traer ajustes que esta no tiene, y no es un error.
+            if a is None or not a.activo or a.tipo == "accion" or a.valor == valores[k]:
+                continue
+            try:
+                self.aplicar_ajuste(k, valores[k])
+            except (UC480Error, ValueError, TypeError) as e:
+                errores.append(f"{k}: {e}")
+        return errores
+
+    def _reaplicar_tiempos(self) -> None:
+        """Tras cambiar el reloj, respeta Mantener y Maximo de los cuadros."""
+        if self.valores.get("fps_max"):
+            self.valores["fps"] = self.set_fps(0)
+        elif self.valores.get("fps_hold"):
+            self.valores["fps"] = self.set_fps(self.valores["fps"])
+        self._reaplicar_exposicion()
+
+    def _reaplicar_exposicion(self) -> None:
+        self._releer()
+        if self.valores.get("exp_max"):
+            self.valores["exposicion"] = self.set_exposure(self.exposure_range()[1])
+        elif self.valores.get("exp_hold"):
+            self.valores["exposicion"] = self.set_exposure(self.valores["exposicion"])
+
+
+def guardar_perfil(cam, ruta: Path) -> Path:
+    """Guarda los ajustes de la camara en JSON, como Save Camera Settings de ThorCam."""
+    datos = {"marca": getattr(cam, "marca", ""), "modelo": getattr(cam, "model", ""),
+             "ajustes": {k: v for k, v in cam.valores.items()
+                         if k in cam.ajustes() and v is not None}}
+    ruta.write_text(json.dumps(datos, indent=2, ensure_ascii=False), encoding="utf-8")
+    return ruta
+
+
+def leer_perfil(ruta: Path) -> dict:
+    """Lee un perfil guardado. ValueError si el archivo no es un perfil."""
+    try:
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        return dict(datos["ajustes"])
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        raise ValueError(f"{ruta.name} no es un perfil de ajustes") from e
+
+
+class ColaAjustes:
+    """Pedidos de la GUI, que aplica el hilo de captura entre dos frames.
+
+    Ninguna llamada al DLL puede caer mientras is_FreezeVideo esta bloqueado en el
+    otro hilo. Arrastrar un slider genera decenas de pedidos: se conserva solo el
+    ultimo de cada clave, porque los intermedios ya no le importan a nadie.
+    """
+
+    RESTABLECER, PERFIL = "__restablecer__", "__perfil__"
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pedidos: dict[str, object] = {}
+        self._hechos: list[tuple[str, object]] = []
+
+    def pedir(self, clave: str, valor=None) -> None:
+        with self._lock:
+            self._pedidos.pop(clave, None)     # al final, para respetar el orden
+            self._pedidos[clave] = valor
+
+    def drenar(self, cam) -> bool:
+        """Aplica lo pendiente. Devuelve True si cambio la geometria o el conjunto."""
+        with self._lock:
+            pedidos, self._pedidos = self._pedidos, {}
+        for clave, valor in pedidos.items():
+            try:
+                if clave == self.RESTABLECER:
+                    res = cam.restablecer()
+                elif clave == self.PERFIL:
+                    res = cam.cargar_valores(valor)
+                else:
+                    res = cam.aplicar_ajuste(clave, valor)
+            except (UC480Error, ValueError, TypeError) as e:
+                res = e
+            with self._lock:
+                self._hechos.append((clave, res))
+        return bool(pedidos)
+
+    def hechos(self) -> list[tuple[str, object]]:
+        """Lo aplicado desde la ultima consulta, para que lo muestre el hilo de Tk."""
+        with self._lock:
+            hechos, self._hechos = self._hechos, []
+        return hechos
+
+
+class UC480Camera(AjustesMixin):
+    """Acceso por ctypes a la API uc480/uEye, por el driver de Thorlabs."""
+
+    DRIVER = "uc480"
+
+    def __init__(self, cfg: Config, info: dict | None = None):
+        global _camaras_abiertas
         self.cfg = cfg
         self.transfer_errors = 0
-        self.dll = _cargar_dll()
+        self.driver = self.DRIVER
+        self._cancelar = threading.Event()
+        self.dll = _cargar_dll(self.driver)
 
-        self.h = C.c_uint32(0)
-        self._check(self.dll.is_InitCamera(C.byref(self.h), None), "is_InitCamera")
+        self.h = C.c_uint32((info or {}).get("id", cfg.camera_id))
+        with _dll_lock:
+            rc = self.dll.is_InitCamera(C.byref(self.h), None)
+            if rc == IS_SUCCESS:
+                _camaras_abiertas += 1
+        if rc != IS_SUCCESS:
+            self.h = C.c_uint32(0)
+            raise UC480Error(f"is_InitCamera devolvio rc={rc}; si ThorCam o uEye Cockpit "
+                             "estan abiertos, cierralos")
+        try:
+            self._configurar(cfg)
+        except UC480Error:
+            self.close()
+            raise
 
+    def _configurar(self, cfg: Config) -> None:
         info = self._sensor_info()
         self.width = int(info.nMaxWidth)
         self.full_height = int(info.nMaxHeight)
-        self.model = info.strSensorName.decode(errors="replace")
+        self.model = info.strSensorName.decode(errors="replace").strip()
         self.pixel_um = info.wPixelSize / 100.0
+        self.serie, self.fabricante = self._identidad()
+        self.marca = clasificar_marca(self.fabricante, self.model, self.driver)
 
         if cfg.raw:
             mode, bpp = IS_CM_SENSOR_RAW8, 8
@@ -291,21 +941,17 @@ class UC480Camera:
         self._check(self.dll.is_SetColorMode(self.h, mode), "is_SetColorMode")
         self._check(self.dll.is_SetDisplayMode(self.h, IS_SET_DM_DIB), "is_SetDisplayMode")
         self._set_manual()
+        self.bpp = bpp
 
         # El binning suma carga dentro del CCD, antes del ADC, y reduce el alto.
         # Hay que fijarlo antes de reservar memoria o el buffer queda mal medido.
+        self.cap = self._leer_capacidades(info)
+        if cfg.binning > 1 and not self.cap["bin_mask"] & FACTORES_V.get(cfg.binning, 0):
+            raise UC480Error(f"esta camara no admite binning vertical {cfg.binning}x")
         self._check(self.dll.is_SetBinning(self.h, BINNING_MODES[cfg.binning]),
                     "is_SetBinning")
-        self.height = self.full_height // cfg.binning
-
         self.mem, self.mem_id = C.c_char_p(), C.c_int()
-        self._check(self.dll.is_AllocImageMem(self.h, self.width, self.height, bpp,
-                                              C.byref(self.mem), C.byref(self.mem_id)),
-                    "is_AllocImageMem")
-        self._check(self.dll.is_SetImageMem(self.h, self.mem, self.mem_id), "is_SetImageMem")
-        pitch = C.c_int()
-        self._check(self.dll.is_GetImageMemPitch(self.h, C.byref(pitch)), "is_GetImageMemPitch")
-        self.pitch = int(pitch.value)
+        self._reservar_buffer()
 
         # El orden importa: cada paso reajusta el rango valido del siguiente.
         if cfg.pixel_clock:
@@ -314,8 +960,11 @@ class UC480Camera:
         self.fps = self.set_fps(cfg.fps)
         self.exposure_ms = self.set_exposure(cfg.exposure_ms)
         self.dll.is_SetTimeout(self.h, IS_TRIGGER_TIMEOUT, 3000)
+        self._iniciar_valores()
 
     def _check(self, rc: int, what: str) -> None:
+        if rc == IS_NOT_SUPPORTED:
+            raise UC480Error(f"esta camara no soporta {what} (rc={rc})")
         if rc != IS_SUCCESS:
             raise UC480Error(f"{what} devolvio rc={rc}")
 
@@ -331,6 +980,238 @@ class UC480Camera:
         si = SENSORINFO()
         self._check(self.dll.is_GetSensorInfo(self.h, C.byref(si)), "is_GetSensorInfo")
         return si
+
+    def _identidad(self) -> tuple[str, str]:
+        b = BOARDINFO()
+        if self.dll.is_GetCameraInfo(self.h, C.byref(b)) != IS_SUCCESS:
+            return "", ""
+        return (b.SerNo.decode(errors="replace").strip(),
+                b.ID.decode(errors="replace").strip())
+
+    def _reservar_buffer(self) -> None:
+        """Mide el AOI actual y reserva el buffer para ese tamaño."""
+        r = IS_RECT()
+        self._check(self.dll.is_AOI(self.h, IS_AOI_IMAGE_GET_AOI, C.byref(r), C.sizeof(r)),
+                    "is_AOI")
+        if self.mem:
+            self.dll.is_FreeImageMem(self.h, self.mem, self.mem_id)
+            self.mem, self.mem_id = C.c_char_p(), C.c_int()
+        self.width, self.height = int(r.w), int(r.h)
+        self._check(self.dll.is_AllocImageMem(self.h, self.width, self.height, self.bpp,
+                                              C.byref(self.mem), C.byref(self.mem_id)),
+                    "is_AllocImageMem")
+        self._check(self.dll.is_SetImageMem(self.h, self.mem, self.mem_id), "is_SetImageMem")
+        pitch = C.c_int()
+        self._check(self.dll.is_GetImageMemPitch(self.h, C.byref(pitch)), "is_GetImageMemPitch")
+        self.pitch = int(pitch.value)
+
+    def _leer_capacidades(self, si) -> dict:
+        """Pregunta que admite esta camara, sin suponer nada por el modelo."""
+        d, h = self.dll, self.h
+        bl = d.is_SetBlCompensation(h, IS_GET_BL_SUPPORTED_MODE, 0, 0)
+        features, gpios, exp_caps = C.c_uint(0), C.c_uint(0), C.c_uint(0)
+        d.is_DeviceFeature(h, IS_FEATURE_GET, C.byref(features), 4)
+        d.is_IO(h, IS_IO_GPIOS_SOPORTADOS, C.byref(gpios), 4)
+        d.is_Exposure(h, IS_EXPOSURE_CMD_CAPS, C.byref(exp_caps), 4)
+        fmin, fmax = IO_FLASH_PARAMS(), IO_FLASH_PARAMS()
+        flash = (d.is_IO(h, IS_IO_FLASH_MIN, C.byref(fmin), C.sizeof(fmin)) == IS_SUCCESS
+                 and d.is_IO(h, IS_IO_FLASH_MAX, C.byref(fmax), C.sizeof(fmax)) == IS_SUCCESS)
+        d_min = d.is_SetTriggerDelay(h, IS_GET_MIN_TRIGGER_DELAY)
+        d_max = d.is_SetTriggerDelay(h, IS_GET_MAX_TRIGGER_DELAY)
+        cap = {
+            "master": bool(si.bMasterGain),
+            "rgb": bool(si.bRGain or si.bGGain or si.bBGain),
+            "color": si.nColorMode != b"\x01",        # 1 = sensor monocromo
+            "boost": d.is_SetGainBoost(h, IS_GET_SUPPORTED_GAINBOOST) == IS_SET_GAINBOOST_ON,
+            "negro_auto": bool(bl & IS_BL_COMPENSATION_ENABLE) if bl > 0 else False,
+            "negro_offset": bool(bl & IS_BL_COMPENSATION_OFFSET) if bl > 0 else False,
+            "gamma_sensor": d.is_SetHardwareGamma(h, IS_GET_HW_SUPPORTED_GAMMA) == IS_SET_HW_GAMMA_ON,
+            "bin_mask": max(d.is_SetBinning(h, IS_GET_SUPPORTED), 0),
+            "sub_mask": max(d.is_SetSubSampling(h, IS_GET_SUPPORTED), 0),
+            "features": features.value,
+            "gpios": gpios.value,
+            "exp_larga": bool(exp_caps.value & IS_EXPOSURE_CAP_LARGA),
+            "flash": flash,
+            "flash_delay": (fmin.s32Delay, fmax.s32Delay, 1) if flash else None,
+            "flash_dur": (fmin.u32Duration, fmax.u32Duration, 1) if flash else None,
+            "trigger_delay": (d_min, d_max, 1) if 0 <= d_min < d_max else None,
+            "borde": self._rango_uint(d.is_EdgeEnhancement, IS_EDGE_RANGO),
+            "reloj": self._rango_uint(d.is_PixelClock, IS_PIXELCLOCK_CMD_RANGO),
+            "log_valor": self._rango_uint(d.is_DeviceFeature, IS_LOG_VALOR_RANGO),
+            "log_ganancia": self._rango_uint(d.is_DeviceFeature, IS_LOG_GAIN_RANGO),
+        }
+        pwm_gpios, pmin, pmax = C.c_uint(0), IO_PWM_PARAMS(), IO_PWM_PARAMS()
+        if (d.is_IO(h, IS_IO_PWM_GPIOS, C.byref(pwm_gpios), 4) == IS_SUCCESS and pwm_gpios.value
+                and d.is_IO(h, IS_IO_PWM_MIN, C.byref(pmin), C.sizeof(pmin)) == IS_SUCCESS
+                and d.is_IO(h, IS_IO_PWM_MAX, C.byref(pmax), C.sizeof(pmax)) == IS_SUCCESS):
+            cap["pwm_hz"] = (pmin.dblFrequency_Hz, pmax.dblFrequency_Hz, 0.01)
+            cap["pwm_duty"] = (pmin.dblDutyCycle, pmax.dblDutyCycle, 0.01)
+        return cap
+
+    def _rango_uint(self, funcion, comando: int) -> tuple[int, int, int] | None:
+        """Lee un (minimo, maximo, paso) de los comandos que lo devuelven en 3 UINT."""
+        r = (C.c_uint * 3)()
+        if funcion(self.h, comando, r, C.sizeof(r)) != IS_SUCCESS or r[1] <= r[0]:
+            return None
+        return int(r[0]), int(r[1]), max(int(r[2]), 1)
+
+    def _leer_ganancia(self, comando: int) -> int:
+        return self.dll.is_SetHardwareGain(self.h, comando, IS_IGNORE_PARAMETER,
+                                           IS_IGNORE_PARAMETER, IS_IGNORE_PARAMETER)
+
+    def _iniciar_valores(self) -> None:
+        """Foto inicial de los ajustes: lo que quedo en la camara despues de abrirla."""
+        r, g, b = (self._leer_ganancia(c) for c in IS_GET_DEFAULT_RGB)
+        # La ganancia por canal se deja en la que trae el driver: es una constante
+        # por canal y no rompe la linealidad. Restablecer vuelve a ese valor.
+        self.defectos_camara = {"ganancia_r": r, "ganancia_g": g, "ganancia_b": b}
+        ar, ag, ab = (self._leer_ganancia(c) for c in IS_GET_RGB)
+        self.valores = {
+            **DEFECTOS, "ganancia_r": ar, "ganancia_g": ag, "ganancia_b": ab,
+            "pixel_clock": self.pixel_clock, "fps": self.fps,
+            "exposicion": self.exposure_ms, "ganancia": self.cfg.gain,
+            "bin_v": f"{self.cfg.binning}x", "obturador": None, "trigger_delay_us": (self.cap["trigger_delay"] or (0,))[0],
+            "flash_delay_us": (self.cap["flash_delay"] or (0,))[0],
+            "flash_dur_us": (self.cap["flash_dur"] or (0,))[0],
+        }
+        self._releer()
+
+    def _releer(self) -> None:
+        """Actualiza los rangos que dependen de otros ajustes y lo que quedo real."""
+        tmin, tmax, paso = C.c_double(), C.c_double(), C.c_double()
+        if self.dll.is_GetFrameTimeRange(self.h, C.byref(tmin), C.byref(tmax),
+                                         C.byref(paso)) == IS_SUCCESS and tmin.value > 0:
+            self.cap["fps"] = (1.0 / tmax.value, 1.0 / tmin.value, 0.01)
+        lo, hi = self.exposure_range()
+        self.cap["exposicion"] = (lo, hi, max(self._exp_incremento(), 0.001))
+        self.valores["pixel_clock"] = self.pixel_clock = self.get_pixel_clock()
+        self.valores["fps"] = self.fps
+        got = C.c_double()
+        self.dll.is_Exposure(self.h, IS_EXPOSURE_CMD_GET, C.byref(got), 8)
+        self.exposure_ms = self.valores["exposicion"] = got.value
+
+    def _exp_incremento(self) -> float:
+        inc = C.c_double()
+        self.dll.is_Exposure(self.h, IS_EXPOSURE_CMD_INC, C.byref(inc), 8)
+        return inc.value
+
+    # --- cada ajuste, contra el SDK ---
+
+    def _hw(self, clave: str, v):
+        d, h = self.dll, self.h
+        if clave in CLAVES_GEOMETRIA:
+            return self._aplicar_geometria()
+        if clave == "pixel_clock":
+            return self.set_pixel_clock(int(v))
+        if clave == "fps":
+            self.set_fps(float(v))
+        elif clave == "exposicion":
+            self.set_exposure(float(v))
+        elif clave == "exp_auto":
+            self._auto(IS_SET_ENABLE_AUTO_SHUTTER, v)
+        elif clave == "exp_larga":
+            e = C.c_uint(int(v))
+            self._check(d.is_Exposure(h, IS_EXPOSURE_CMD_LARGA_SET, C.byref(e), 4), "exposicion larga")
+        elif clave == "ganancia":
+            self._check(d.is_SetHardwareGain(h, int(v), IS_IGNORE_PARAMETER, IS_IGNORE_PARAMETER,
+                                             IS_IGNORE_PARAMETER), "ganancia")
+        elif clave == "ganancia_auto":
+            self._auto(IS_SET_ENABLE_AUTO_GAIN, v)
+        elif clave == "gain_boost":
+            self._check(d.is_SetGainBoost(h, IS_SET_GAINBOOST_ON if v else IS_SET_GAINBOOST_OFF),
+                        "gain boost")
+        elif clave in ("negro", "negro_auto"):
+            modo = (IS_BL_COMPENSATION_ENABLE if self.valores.get("negro_auto")
+                    else IS_BL_COMPENSATION_DISABLE)
+            offset = int(self.valores.get("negro") or 0)
+            self._check(d.is_SetBlCompensation(h, modo, offset, 0), "nivel de negro")
+        elif clave == "awb":
+            self._auto(IS_SET_ENABLE_AUTO_WB, v)
+        elif clave in ("ganancia_r", "ganancia_g", "ganancia_b"):
+            canales = [IS_IGNORE_PARAMETER] * 3
+            canales["rgb".index(clave[-1])] = int(v)
+            self._check(d.is_SetHardwareGain(h, IS_IGNORE_PARAMETER, *canales), "ganancia de color")
+        elif clave == "gamma":
+            self._check(d.is_SetGamma(h, int(round(float(v) * 100))), "gamma")
+        elif clave == "gamma_sensor":
+            self._check(d.is_SetHardwareGamma(h, IS_SET_HW_GAMMA_ON if v else IS_SET_GAMMA_OFF),
+                        "gamma de sensor")
+        elif clave == "borde":
+            e = C.c_uint(int(v))
+            self._check(d.is_EdgeEnhancement(h, IS_EDGE_SET, C.byref(e), 4), "realce de bordes")
+        elif clave in ("sat_u", "sat_v"):
+            self._check(d.is_SetSaturation(h, int(self.valores["sat_u"]),
+                                           int(self.valores["sat_v"])), "saturacion")
+        elif clave == "espejo_lr":
+            self._check(d.is_SetRopEffect(h, IS_SET_ROP_MIRROR_LEFTRIGHT, int(v), 0), "espejo")
+        elif clave == "espejo_ud":
+            self._check(d.is_SetRopEffect(h, IS_SET_ROP_MIRROR_UPDOWN, int(v), 0), "espejo")
+        elif clave == "obturador":
+            m = C.c_uint(MODOS_OBTURADOR[v])
+            self._check(d.is_DeviceFeature(h, IS_SHUTTER_SET, C.byref(m), 4), "obturador")
+        elif clave == "log_modo":
+            m = C.c_uint(MODOS_LOG[v])
+            self._check(d.is_DeviceFeature(h, IS_LOG_MODO_SET, C.byref(m), 4), "modo log")
+        elif clave in ("log_valor", "log_ganancia"):
+            comando = IS_LOG_VALOR_SET if clave == "log_valor" else IS_LOG_GAIN_SET
+            m = C.c_uint(int(v))
+            self._check(d.is_DeviceFeature(h, comando, C.byref(m), 4), "modo log")
+        elif clave == "trigger_modo":
+            self._check(d.is_SetExternalTrigger(h, MODOS_TRIGGER[v]), "trigger")
+        elif clave in ("trigger_delay_on", "trigger_delay_us"):
+            us = int(self.valores["trigger_delay_us"]) if self.valores["trigger_delay_on"] else 0
+            self._check(d.is_SetTriggerDelay(h, us), "retardo de trigger")
+        elif clave == "trigger_estado":
+            return d.is_SetExternalTrigger(h, IS_GET_TRIGGER_STATUS)
+        elif clave == "flash_modo":
+            m = C.c_uint(MODOS_FLASH[v])
+            self._check(d.is_IO(h, IS_IO_FLASH_SET_MODO, C.byref(m), 4), "flash")
+        elif clave in ("flash_delay_us", "flash_dur_us", "flash_auto"):
+            # Duracion 0 es como el SDK pide que el flash dure lo que la exposicion.
+            dur = 0 if self.valores["flash_auto"] else int(self.valores["flash_dur_us"])
+            p = IO_FLASH_PARAMS(int(self.valores["flash_delay_us"]), dur)
+            self._check(d.is_IO(h, IS_IO_FLASH_SET_PARAMS, C.byref(p), C.sizeof(p)), "flash")
+        elif clave in ("pwm_hz", "pwm_duty"):
+            p = IO_PWM_PARAMS(float(self.valores["pwm_hz"]), float(self.valores["pwm_duty"]))
+            self._check(d.is_IO(h, IS_IO_PWM_SET, C.byref(p), C.sizeof(p)), "PWM")
+        elif clave in ("gpio1", "gpio2"):
+            conf, estado = MODOS_GPIO[v]
+            g = IO_GPIO_CONFIGURATION()
+            g.u32Gpio, g.u32Configuration, g.u32State = (1 if clave == "gpio1" else 2), conf, estado
+            self._check(d.is_IO(h, IS_IO_GPIO_SET, C.byref(g), C.sizeof(g)), "GPIO")
+        # fps_hold, fps_max, exp_hold, exp_max, sat_combinar y trigger_timeout_ms no
+        # le dicen nada a la camara: los usa el programa.
+        return v
+
+    def _auto(self, param: int, activo) -> None:
+        on, aux = C.c_double(1.0 if activo else 0.0), C.c_double(0.0)
+        self._check(self.dll.is_SetAutoParameter(self.h, param, C.byref(on), C.byref(aux)),
+                    "modo automatico")
+
+    def _aplicar_geometria(self) -> None:
+        """Binning y submuestreo: cambian el tamaño, asi que se rehace el buffer."""
+        v = self.valores
+        def mascara(clave, factores):
+            return factores.get(factor_de_opcion(v[clave]), 0)
+        binning = mascara("bin_h", FACTORES_H) | mascara("bin_v", FACTORES_V)
+        submuestreo = mascara("sub_h", FACTORES_H) | mascara("sub_v", FACTORES_V)
+        # Se limpia uno antes de fijar el otro: el SDK rechaza combinaciones que
+        # dejarian los dos activos a medio camino.
+        self._check(self.dll.is_SetSubSampling(self.h, 0), "submuestreo")
+        self._check(self.dll.is_SetBinning(self.h, binning), "binning")
+        self._check(self.dll.is_SetSubSampling(self.h, submuestreo), "submuestreo")
+        self._reservar_buffer()
+        self.cfg = replace(self.cfg, binning=factor_de_opcion(v["bin_v"]))
+        # El cuadro maximo depende de cuantas filas se leen.
+        self.set_fps(v["fps"])
+        self.set_exposure(v["exposicion"])
+
+    def cancelar(self) -> None:
+        """Corta una espera de trigger. Se puede llamar desde cualquier hilo."""
+        self._cancelar.set()
+
+    def reanudar(self) -> None:
+        self._cancelar.clear()
 
     def _set_manual(self) -> None:
         """Deja la cadena de imagen lineal y bajo control manual."""
@@ -362,6 +1243,27 @@ class UC480Camera:
         self.fps = got.value
         return self.fps
 
+    def _grab_con_trigger(self) -> None:
+        """Espera un pulso externo sin dejar el hilo clavado en el DLL.
+
+        Con flanco externo is_FreezeVideo no vuelve hasta que llegue el pulso o
+        venza su espera. Se le pide de a un segundo, para que Detener y cerrar la
+        ventana respondan aunque el tiempo de espera configurado sea de una hora.
+        """
+        limite = time.monotonic() + float(self.valores["trigger_timeout_ms"]) / 1000.0
+        while True:
+            if self._cancelar.is_set():
+                raise CapturaCancelada("captura cancelada")
+            resta = limite - time.monotonic()
+            if resta <= 0:
+                raise TriggerTimeout("no llego ningun pulso de trigger")
+            # is_FreezeVideo toma la espera en unidades de 10 ms.
+            rc = self.dll.is_FreezeVideo(self.h, max(1, min(100, int(resta * 100))))
+            if rc == IS_SUCCESS:
+                return
+            if rc != IS_TIMED_OUT:
+                self._check(rc, "is_FreezeVideo")
+
     def exposure_range(self) -> tuple[float, float]:
         lo, hi = C.c_double(), C.c_double()
         self.dll.is_Exposure(self.h, IS_EXPOSURE_CMD_RANGE_MIN, C.byref(lo), 8)
@@ -385,13 +1287,16 @@ class UC480Camera:
         riesgo de leer un buffer a medio escribir. Sobre USB 2.0 falla de forma
         intermitente con IS_TRANSFER_ERROR; de ahi los reintentos.
         """
-        rc = IS_TRANSFER_ERROR
-        for _ in range(self.cfg.retries + 1):
-            rc = self.dll.is_FreezeVideo(self.h, IS_WAIT)
-            if rc == IS_SUCCESS:
-                break
-            self.transfer_errors += 1
-        self._check(rc, "is_FreezeVideo")
+        if self.valores["trigger_modo"].startswith("flanco"):
+            self._grab_con_trigger()
+        else:
+            rc = IS_TRANSFER_ERROR
+            for _ in range(self.cfg.retries + 1):
+                rc = self.dll.is_FreezeVideo(self.h, IS_WAIT)
+                if rc == IS_SUCCESS:
+                    break
+                self.transfer_errors += 1
+            self._check(rc, "is_FreezeVideo")
 
         raw = C.string_at(self.mem, self.pitch * self.height)
         arr = np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.pitch)
@@ -400,10 +1305,14 @@ class UC480Camera:
         return arr[:, :, 0] if self.channels == 1 else arr
 
     def close(self) -> None:
+        global _camaras_abiertas
         if getattr(self, "h", None) and self.h.value:
-            self.dll.is_FreeImageMem(self.h, self.mem, self.mem_id)
+            if getattr(self, "mem", None):
+                self.dll.is_FreeImageMem(self.h, self.mem, self.mem_id)
             self.dll.is_ExitCamera(self.h)
             self.h = C.c_uint32(0)
+            with _dll_lock:
+                _camaras_abiertas -= 1
 
     def __enter__(self):
         return self
@@ -413,16 +1322,44 @@ class UC480Camera:
         return False
 
 
-class DemoCamera:
+class UEyeCamera(UC480Camera):
+    """La misma API por el driver de IDS, para una uEye enlazada a uEye_api_64.dll."""
+
+    DRIVER = "ueye"
+
+
+CLASES_CAMARA = {"uc480": UC480Camera, "ueye": UEyeCamera}
+
+
+class DemoCamera(AjustesMixin):
     """Patron sintetico con franjas cos^2, para trabajar en la UI sin camara."""
 
     model, pixel_clock, fps = "DEMO", 0, 30.0
+    marca, driver, serie, fabricante = "DEMO", "demo", "", ""
 
     def __init__(self, cfg: Config):
         self.cfg, self.exposure_ms, self._t = cfg, cfg.exposure_ms, 0
         self.width, self.full_height = 640, 480
+        self.full_width = self.width
         self.height = self.full_height // cfg.binning
         self.transfer_errors = 0
+        # Declara todo como soportado: asi la ventana de ajustes se puede probar
+        # entera sin hardware.
+        self.cap = {
+            "master": True, "rgb": True, "color": True, "boost": True, "negro_auto": True,
+            "negro_offset": True, "gamma_sensor": True, "exp_larga": True,
+            "bin_mask": 0x3f, "sub_mask": 0x0f, "features": 0xE3, "gpios": 3,
+            "flash": True, "flash_delay": (0, 100000, 1), "flash_dur": (0, 100000, 1),
+            "trigger_delay": (15, 4000000, 1), "borde": (0, 9, 1), "reloj": (5, 43, 1),
+            "log_valor": (0, 12, 1), "log_ganancia": (0, 4, 1), "fps": (0.5, 30.0, 0.01),
+            "exposicion": (*self.exposure_range(), 0.01), "pwm_hz": (1.0, 10000.0, 0.01),
+            "pwm_duty": (0.0, 1.0, 0.01),
+        }
+        self.defectos_camara = {"ganancia_r": 0, "ganancia_g": 0, "ganancia_b": 0}
+        self.valores = {**DEFECTOS, **self.defectos_camara, "pixel_clock": 24,
+                        "fps": self.fps, "exposicion": self.exposure_ms,
+                        "ganancia": cfg.gain, "bin_v": f"{cfg.binning}x",
+                        "obturador": "global", "trigger_delay_us": 15}
 
     def grab(self) -> np.ndarray:
         self._t += 1
@@ -430,8 +1367,43 @@ class DemoCamera:
         base = 120 * np.cos(np.deg2rad(self._t * 2) + xx / 180.0) ** 2 + 20
         img = np.stack([base * 0.9, base, base * 0.75], axis=2)
         ruido = np.random.default_rng(self._t).normal(0, 1.5, img.shape)
-        img = img * (self.exposure_ms / 20.0) * self.cfg.binning + ruido
+        ganancia = 1.0 + float(self.valores["ganancia"]) / 100.0 * 3.0
+        img = (img * (self.exposure_ms / 20.0) * factor_de_opcion(self.valores["bin_v"])
+               * ganancia + ruido)
+        gamma = float(self.valores["gamma"])
+        if gamma != 1.0:
+            img = 255.0 * (np.clip(img, 0, 255) / 255.0) ** (1.0 / gamma)
+        if self.valores["espejo_lr"]:
+            img = img[:, ::-1]
+        if self.valores["espejo_ud"]:
+            img = img[::-1]
         return np.clip(img, 0, 255).astype(np.uint8)
+
+    def _hw(self, clave: str, v):
+        if clave in CLAVES_GEOMETRIA:
+            bin_h, bin_v, sub_h, sub_v = (factor_de_opcion(self.valores[k])
+                                          for k in ("bin_h", "bin_v", "sub_h", "sub_v"))
+            self.width = self.full_width // (bin_h * sub_h)
+            self.height = self.full_height // (bin_v * sub_v)
+        elif clave == "fps":
+            self.fps = float(v)
+        elif clave == "exposicion":
+            self.set_exposure(float(v))
+        elif clave == "trigger_estado":
+            return 0
+        return v
+
+    def _releer(self) -> None:
+        self.valores["exposicion"] = self.exposure_ms
+        self.valores["fps"] = self.fps
+
+    def set_fps(self, fps: float) -> float:
+        self.fps = fps or self.cap["fps"][1]
+        return self.fps
+
+    def cancelar(self) -> None: ...
+
+    def reanudar(self) -> None: ...
 
     def set_exposure(self, ms: float) -> float:
         lo, hi = self.exposure_range()
@@ -452,7 +1424,27 @@ class DemoCamera:
 
 
 def open_camera(cfg: Config) -> Camera:
-    return DemoCamera(cfg) if cfg.demo else UC480Camera(cfg)
+    """Detecta que hay conectado y abre la camara con el driver que le corresponde."""
+    if cfg.demo:
+        return DemoCamera(cfg)
+    camaras = detectar_camaras(cfg.driver)
+    elegida = elegir_camara(camaras, cfg)
+    if elegida is None:
+        if camaras:
+            raise UC480Error("todas las camaras estan ocupadas; cierra ThorCam o uEye "
+                             "Cockpit:\n" + "\n".join(describir_camara(c) for c in camaras))
+        pista = diagnostico_usb()
+        raise UC480Error("ninguna camara Thorlabs ni uEye responde." + (f"\n\n{pista}" if pista else ""))
+    return CLASES_CAMARA[elegida["driver"]](cfg, elegida)
+
+
+def ficha_camara(cam) -> str:
+    """El texto de la ficha de camara: que tipo es, antes que nada."""
+    if getattr(cam, "driver", "") == "demo":
+        return "Tipo: DEMO (sin camara)"
+    return (f"Tipo: {cam.marca}\n"
+            f"Modelo: {cam.model}  s/n {cam.serie or '?'}\n"
+            f"Driver: {DRIVERS[cam.driver]['dll']}")
 
 
 # --- dark frame -----------------------------------------------------------
@@ -693,9 +1685,10 @@ def benchmark(cfg: Config, n: int = 25) -> list[dict]:
     velocidad, el problema es el enlace fisico y no el ancho de banda.
     """
     rows = []
-    with UC480Camera(cfg) as cam:
+    with open_camera(replace(cfg, demo=False)) as cam:
         mb = cam.width * cam.height * cam.channels / 1e6
-        for clk in PIXEL_CLOCKS:
+        lo, hi, _ = cam.cap["reloj"] or (0, 0, 1)
+        for clk in (c for c in PIXEL_CLOCKS if lo <= c <= hi):
             cam.set_pixel_clock(clk)
             cam.set_fps(cfg.fps)
             cam.set_exposure(cfg.exposure_ms)
@@ -778,6 +1771,20 @@ def _aplicar_estilo(root) -> None:
            selectbackground=[("readonly", CYBER["hundido"])],
            selectforeground=[("readonly", CYBER["texto"])],
            foreground=[("readonly", CYBER["texto"])])
+    st.configure("TNotebook", background=CYBER["fondo"], bordercolor=CYBER["borde"])
+    st.configure("TNotebook.Tab", background=CYBER["panel"], foreground=CYBER["tenue"],
+                 bordercolor=CYBER["borde"], padding=(6, 3), font=("Consolas", 8))
+    st.map("TNotebook.Tab", background=[("selected", CYBER["hundido"])],
+           foreground=[("selected", CYBER["neon"])])
+    st.configure("Horizontal.TScale", background=CYBER["panel"], troughcolor=CYBER["hundido"],
+                 bordercolor=CYBER["borde"])
+    # Clam pinta de blanco una barra desactivada, que encandila en el tema oscuro.
+    st.map("Horizontal.TScale",
+           background=[("disabled", CYBER["hundido"]), ("active", CYBER["neon"])],
+           troughcolor=[("disabled", CYBER["fondo"])],
+           bordercolor=[("disabled", CYBER["hundido"])],
+           lightcolor=[("disabled", CYBER["hundido"])],
+           darkcolor=[("disabled", CYBER["hundido"])])
     st.configure("TCheckbutton", background=CYBER["fondo"], foreground=CYBER["texto"],
                  indicatorcolor=CYBER["hundido"], focuscolor=CYBER["fondo"])
     st.map("TCheckbutton", indicatorcolor=[("selected", CYBER["neon"])],
@@ -853,6 +1860,9 @@ def perfil_vertical(frame: np.ndarray, x: int) -> np.ndarray:
     return np.asarray(frame)[:, x, ::-1]
 
 
+TEXTO_DETECTAR = "Detectar camara (Thorlabs/uEye)"
+
+
 def _remuestrear(vals: np.ndarray, n: int) -> np.ndarray:
     """Baja la cantidad de puntos a n para dibujarlos en un canvas angosto.
 
@@ -862,6 +1872,263 @@ def _remuestrear(vals: np.ndarray, n: int) -> np.ndarray:
     if n <= 0 or len(vals) <= n:
         return vals
     return vals[np.linspace(0, len(vals) - 1, n).astype(int)]
+
+
+class VentanaAjustes:
+    """Los ajustes de camara de ThorCam, en una ventana aparte.
+
+    Se arma leyendo construir_ajustes: agregar un ajuste a la tabla alcanza para
+    que aparezca. Los cambios no tocan el DLL desde aca: van a app.cola y los
+    aplica el hilo de captura entre dos frames, porque con la camara capturando el
+    SDK esta ocupado. Con el visor detenido los aplica procesar_ajustes.
+    """
+
+    def __init__(self, root, app) -> None:
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.tk, self.ttk, self.app = tk, ttk, app
+        self.top = tk.Toplevel(root, background=CYBER["fondo"])
+        self.top.title("Ajustes de camara")
+        alto = min(660, root.winfo_screenheight() - 120)
+        self.top.geometry(f"700x{alto}")
+        self.top.protocol("WM_DELETE_WINDOW", self.cerrar)
+        self._ajustando = False
+        self._cam = None
+        self._controles: dict[str, dict] = {}
+        self.libro = None
+        self.lbl_aviso = ttk.Label(self.top, foreground=CYBER["alerta"], wraplength=670,
+                                   justify="left", font=("Consolas", 8))
+        self.lbl_aviso.pack(side="bottom", fill="x", padx=8, pady=(0, 6))
+        self.lbl_perdidos = ttk.Label(self.top, foreground=CYBER["tenue"],
+                                      font=("Consolas", 8))
+        self.lbl_perdidos.pack(side="bottom", anchor="w", padx=8)
+        fila = ttk.Frame(self.top)
+        fila.pack(side="bottom", fill="x", padx=8, pady=6)
+        ttk.Button(fila, text="Cargar perfil...", command=self.cargar).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(fila, text="Guardar perfil...", command=self.guardar).pack(
+            side="left", fill="x", expand=True, padx=4)
+        ttk.Button(fila, text="Restablecer todo", style="Neon.TButton",
+                   command=self.restablecer).pack(side="left", fill="x", expand=True)
+        self.reconstruir()
+
+    def existe(self) -> bool:
+        return bool(self.top.winfo_exists())
+
+    def cerrar(self) -> None:
+        self.app.win_ajustes = None
+        self.top.destroy()
+
+    def reconstruir(self) -> None:
+        """Rearma las pestañas para la camara abierta: cada una declara lo suyo."""
+        ttk = self.ttk
+        if self.libro is not None:
+            self.libro.destroy()
+        self._controles.clear()
+        self._cam = self.app.cam
+        self.libro = ttk.Notebook(self.top)
+        self.libro.pack(side="top", fill="both", expand=True, padx=8, pady=(8, 0))
+        if self._cam is None:
+            self.lbl_aviso.config(text="no hay camara abierta")
+            return
+        self.top.title(f"Ajustes de camara - {self._cam.marca} {self._cam.model}")
+        tabla = self._cam.ajustes()
+        for pestana in PESTANAS:
+            hoja = ttk.Frame(self.libro)
+            self.libro.add(hoja, text=pestana)
+            interno = panel_con_scroll(hoja, ancho=650)
+            grupos: dict[str, object] = {}
+            for a in tabla.values():
+                if a.pestana != pestana:
+                    continue
+                if a.grupo not in grupos:
+                    grupos[a.grupo] = ttk.LabelFrame(interno, text=a.grupo, padding=6)
+                    grupos[a.grupo].pack(fill="x", pady=(0, 6))
+                    grupos[a.grupo].columnconfigure(0, weight=1)
+                self._crear_control(grupos[a.grupo], a)
+        self.refrescar()
+
+    def _crear_control(self, padre, a: Ajuste) -> None:
+        tk, ttk = self.tk, self.ttk
+        fila = padre.grid_size()[1]
+        c: dict = {"ajuste": a}
+        if a.tipo == "rango":
+            ttk.Label(padre, text=a.etiqueta).grid(row=fila, column=0, sticky="w")
+            c["var"] = tk.StringVar()
+            c["spin"] = ttk.Spinbox(padre, width=11, textvariable=c["var"], from_=a.minimo,
+                                    to=a.maximo, increment=a.paso,
+                                    command=lambda k=a.clave: self._desde_spin(k))
+            c["spin"].grid(row=fila, column=1, sticky="e", pady=1)
+            c["spin"].bind("<Return>", lambda _e, k=a.clave: self._desde_spin(k))
+            c["spin"].bind("<FocusOut>", lambda _e, k=a.clave: self._desde_spin(k))
+            c["escala"] = ttk.Scale(padre, orient="horizontal", from_=a.minimo, to=a.maximo,
+                                    command=lambda v, k=a.clave: self._desde_escala(k, v))
+            c["escala"].grid(row=fila + 1, column=0, columnspan=2, sticky="ew")
+            c["rango"] = ttk.Label(padre, font=("Consolas", 8), foreground=CYBER["tenue"],
+                                   wraplength=600, justify="left")
+            c["rango"].grid(row=fila + 2, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        elif a.tipo == "opciones":
+            ttk.Label(padre, text=a.etiqueta).grid(row=fila, column=0, sticky="w")
+            c["var"] = tk.StringVar()
+            c["combo"] = ttk.Combobox(padre, textvariable=c["var"], state="readonly",
+                                      values=a.opciones, width=26)
+            c["combo"].grid(row=fila, column=1, sticky="e", pady=2)
+            c["combo"].bind("<<ComboboxSelected>>",
+                            lambda _e, k=a.clave: self._pedir(k, self._controles[k]["var"].get()))
+        elif a.tipo == "bool":
+            c["var"] = tk.BooleanVar()
+            c["check"] = ttk.Checkbutton(
+                padre, text=a.etiqueta, variable=c["var"],
+                command=lambda k=a.clave: self._pedir(k, self._controles[k]["var"].get()))
+            c["check"].grid(row=fila, column=0, columnspan=2, sticky="w", pady=1)
+        elif a.tipo == "accion":
+            c["boton"] = ttk.Button(padre, text=a.etiqueta,
+                                    command=lambda k=a.clave: self._pedir(k, None))
+            c["boton"].grid(row=fila, column=0, sticky="w", pady=2)
+            c["salida"] = ttk.Label(padre, text="--", font=("Consolas", 9))
+            c["salida"].grid(row=fila, column=1, sticky="e")
+        self._controles[a.clave] = c
+
+    def refrescar(self) -> None:
+        """Pone cada control al dia con la camara: valor, rango y si esta activo."""
+        cam = self.app.cam
+        if cam is None:
+            return
+        self._ajustando = True
+        try:
+            for clave, a in cam.ajustes().items():
+                c = self._controles.get(clave)
+                if c is None:
+                    continue
+                c["ajuste"] = a
+                estado = "normal" if a.activo else "disabled"
+                if a.tipo == "rango":
+                    # No se le pisa el texto a quien esta escribiendo en la casilla.
+                    if self.top.focus_get() is not c["spin"]:
+                        c["var"].set(f"{a.valor:.6g}" if a.valor is not None else "")
+                    c["spin"].config(from_=a.minimo, to=a.maximo, increment=a.paso, state=estado)
+                    c["escala"].config(from_=a.minimo, to=a.maximo)
+                    c["escala"].state(["!disabled"] if a.activo else ["disabled"])
+                    if a.valor is not None:
+                        c["escala"].set(a.valor)
+                    c["rango"].config(text=(f"{a.minimo:.8g} .. {a.maximo:.8g}"
+                                            + (f"   {a.nota}" if a.nota else ""))
+                                      if a.activo else (a.nota or "esta camara no lo admite"))
+                elif a.tipo == "opciones":
+                    c["var"].set("" if a.valor is None else str(a.valor))
+                    c["combo"].config(values=a.opciones,
+                                      state="readonly" if a.activo else "disabled")
+                elif a.tipo == "bool":
+                    c["var"].set(bool(a.valor))
+                    c["check"].state(["!disabled"] if a.activo else ["disabled"])
+        finally:
+            self._ajustando = False
+        self._mostrar_avisos()
+
+    def _mostrar_avisos(self, error: str = "") -> None:
+        cam = self.app.cam
+        if cam is None:
+            return
+        avisos = avisos_no_lineales(cam.valores)
+        texto = error
+        if avisos:
+            texto += ("\n" if texto else "") + "Fuera de la cadena lineal: " + ", ".join(avisos)
+        self.lbl_aviso.config(text=texto)
+
+    def notificar(self, clave: str, res) -> None:
+        """Llega lo que aplico el hilo de captura."""
+        if clave == "trigger_estado" and clave in self._controles:
+            self._controles[clave]["salida"].config(
+                text=str(res) if not isinstance(res, Exception) else "--")
+        self.refrescar()
+        if isinstance(res, Exception):
+            self._mostrar_avisos(str(res))
+        elif isinstance(res, list) and res:
+            self._mostrar_avisos("; ".join(res))
+
+    def mostrar_perdidos(self) -> None:
+        """Los cuadros perdidos del visor, como el Dropped Frames de ThorCam."""
+        total = getattr(self.app, "totales", 0)
+        if total:
+            perdidos = getattr(self.app, "perdidos", 0)
+            self.lbl_perdidos.config(
+                text=f"Cuadros perdidos: {perdidos}/{total} ({perdidos / total * 100:.0f}%)")
+
+    def _pedir(self, clave: str, valor) -> None:
+        if not self._ajustando:
+            self.app.cola.pedir(clave, valor)
+
+    def _desde_escala(self, clave: str, valor: str) -> None:
+        if self._ajustando:
+            return
+        c = self._controles[clave]
+        c["var"].set(f"{float(valor):.6g}")
+        self._pedir(clave, float(valor))
+
+    def _desde_spin(self, clave: str) -> None:
+        c = self._controles[clave]
+        if self._ajustando or not c["ajuste"].activo:
+            return
+        try:
+            valor = float(c["var"].get().replace(",", "."))
+        except ValueError:
+            self.refrescar()
+            return
+        # FocusOut salta tambien sin cambios, y no hay que molestar al SDK por eso.
+        if c["ajuste"].valor is None or abs(valor - float(c["ajuste"].valor)) > 1e-9:
+            self._pedir(clave, valor)
+
+    def restablecer(self) -> None:
+        self.app.cola.pedir(ColaAjustes.RESTABLECER)
+
+    def guardar(self) -> None:
+        from tkinter import filedialog, messagebox
+        if self.app.cam is None:
+            return
+        ruta = filedialog.asksaveasfilename(
+            parent=self.top, title="Guardar perfil de ajustes", defaultextension=".json",
+            initialfile=f"ajustes_{self.app.cam.model}.json".replace(" ", "_"),
+            filetypes=[("Perfil de ajustes", "*.json")])
+        if ruta:
+            try:
+                guardar_perfil(self.app.cam, Path(ruta))
+            except OSError as e:
+                messagebox.showerror("No se pudo guardar", str(e), parent=self.top)
+
+    def cargar(self) -> None:
+        from tkinter import filedialog, messagebox
+        ruta = filedialog.askopenfilename(parent=self.top, title="Cargar perfil de ajustes",
+                                          filetypes=[("Perfil de ajustes", "*.json")])
+        if ruta:
+            try:
+                self.app.cola.pedir(ColaAjustes.PERFIL, leer_perfil(Path(ruta)))
+            except (OSError, ValueError) as e:
+                messagebox.showerror("No se pudo cargar", str(e), parent=self.top)
+
+
+def abrir_ajustes(root, app) -> None:
+    """Abre la ventana de ajustes de la app, o la trae al frente si ya esta."""
+    win = getattr(app, "win_ajustes", None)
+    if win is not None and win.existe():
+        win.top.lift()
+        return
+    app.win_ajustes = VentanaAjustes(root, app)
+
+
+def procesar_ajustes(app) -> None:
+    """En cada cuadro de la GUI: aplica si la captura esta detenida y muestra el resultado."""
+    if app.cam is not None and not app.corriendo.is_set():
+        app.cola.drenar(app.cam)
+    win = getattr(app, "win_ajustes", None)
+    if win is not None and win.existe() and win._cam is not app.cam:
+        win.reconstruir()
+    for clave, res in app.cola.hechos():
+        app.ajuste_aplicado(clave, res)
+        if win is not None and win.existe():
+            win.notificar(clave, res)
+    if win is not None and win.existe():
+        win.mostrar_perdidos()
 
 
 class CamaraGUI:
@@ -904,14 +2171,14 @@ class CamaraGUI:
         self.perfil_pos: tuple[int, int] | None = None
         self.perfil_h_on = False
         self.perfil_v_on = False
-        # La exposicion se aplica desde el hilo de captura, entre frames, para
-        # no tocar el DLL mientras is_FreezeVideo esta bloqueado en el otro.
-        # exp_aplicada es lo que devolvio la camara, que redondea al reloj real.
-        self.exp_pendiente: float | None = None
-        self.exp_aplicada: float | None = None
+        # Los ajustes se aplican desde el hilo de captura, entre frames, para no
+        # tocar el DLL mientras is_FreezeVideo esta bloqueado en el otro.
+        self.cola = ColaAjustes()
+        self.win_ajustes: VentanaAjustes | None = None
+        self.sin_trigger = False
         self._ajustando = False     # evita realimentar el callback de la barra
 
-        root.title("Camara - fotometria RGB para Thorlabs DCx")
+        root.title("Camara - fotometria RGB para Thorlabs DCx e IDS uEye")
         # Medido contra la pantalla: en un portatil de 1366x768 una ventana fija
         # de 760 de alto queda por debajo de la barra de tareas y corta el panel.
         ancho = min(1180, root.winfo_screenwidth() - 60)
@@ -924,6 +2191,9 @@ class CamaraGUI:
         self._abrir_camara()
         self._refrescar_estado()
         self._tick()
+        # Con una camara de verdad, se prende sola: es a lo que se vino.
+        if self.cam is not None and not self.cfg.demo:
+            self.iniciar()
 
     # --- construccion de la ventana ---
 
@@ -944,9 +2214,14 @@ class CamaraGUI:
         self.lbl_cam = ttk.Label(f, text="...", justify="left", wraplength=250,
                                  font=("Consolas", 9))
         self.lbl_cam.pack(anchor="w")
-        self.btn_detectar = ttk.Button(f, text="Detectar camara ThorCam",
-                                       style="Neon.TButton", command=self.detectar)
+        self.lbl_aviso = ttk.Label(f, text="", justify="left", wraplength=250,
+                                   font=("Consolas", 8), foreground=CYBER["alerta"])
+        self.lbl_aviso.pack(anchor="w")
+        self.btn_detectar = ttk.Button(f, text=TEXTO_DETECTAR, style="Neon.TButton",
+                                       command=self.detectar)
         self.btn_detectar.pack(fill="x", pady=(6, 0))
+        ttk.Button(f, text="Ajustes de camara...",
+                   command=lambda: abrir_ajustes(self.root, self)).pack(fill="x", pady=(4, 0))
 
         f = ttk.LabelFrame(izq, text="Captura", padding=6)
         f.pack(fill="x", pady=(6, 0))
@@ -955,13 +2230,13 @@ class CamaraGUI:
         self.var_bin = tk.IntVar(value=self.cfg.binning)
         self.var_avg = tk.IntVar(value=self.cfg.average)
         self.var_roi = tk.IntVar(value=self.cfg.roi_radius)
+        self.spin_gain = ttk.Spinbox(f, from_=0, to=100, width=6, textvariable=self.var_gain)
+        self.spin_bin = ttk.Spinbox(f, from_=min(BINNING_MODES), to=max(BINNING_MODES), width=6,
+                                    textvariable=self.var_bin)
         campos = (
             ("Exposicion (ms)", ttk.Entry(f, textvariable=self.var_exp, width=8)),
-            ("Ganancia (0..100)", ttk.Spinbox(f, from_=0, to=100, width=6,
-                                              textvariable=self.var_gain)),
-            ("Binning vertical", ttk.Spinbox(f, from_=min(BINNING_MODES),
-                                             to=max(BINNING_MODES), width=6,
-                                             textvariable=self.var_bin)),
+            ("Ganancia (0..100)", self.spin_gain),
+            ("Binning vertical", self.spin_bin),
             ("Frames promediados", ttk.Spinbox(f, from_=1, to=64, width=6,
                                                textvariable=self.var_avg)),
             ("Radio del ROI (px)", ttk.Spinbox(f, from_=0, to=64, width=6,
@@ -1094,19 +2369,47 @@ class CamaraGUI:
     # --- camara ---
 
     def _abrir_camara_real(self) -> None:
-        """Abre la camara segun self.cfg y refresca la ficha. Propaga UC480Error."""
+        """Detecta y abre la camara, y refresca la ficha. Propaga UC480Error."""
         self.cam = open_camera(self.cfg)
         self.pos = (self.cam.width // 2, self.cam.height // 2)
-        self.lbl_cam.config(
-            text=("[DEMO] " if self.cfg.demo else "")
-                 + f"{getattr(self.cam, 'model', '?')}  "
-                   f"{self.cam.width}x{self.cam.height}\n"
-                   f"exp {self.cam.exposure_ms:.2f} ms   "
-                   f"clk {getattr(self.cam, 'pixel_clock', 0)} MHz   "
-                   f"bin {self.cfg.binning}x",
-            foreground=CYBER["neon2"] if self.cfg.demo else CYBER["texto"])
+        self.root.title(f"Camara - {self.cam.marca} {self.cam.model}")
+        self._actualizar_ficha()
         self.var_exp.set(f"{self.cam.exposure_ms:g}")
         self._rango_exposicion()
+
+    def _actualizar_ficha(self) -> None:
+        cam = self.cam
+        self.lbl_cam.config(
+            text=f"{ficha_camara(cam)}\n{cam.width}x{cam.height}   "
+                 f"exp {cam.exposure_ms:.2f} ms\n"
+                 f"clk {getattr(cam, 'pixel_clock', 0)} MHz   {cam.fps:.1f} fps",
+            foreground=CYBER["neon2"] if self.cfg.demo else CYBER["ok"])
+        # Lo que esta camara no tiene no se ofrece: la uEye C1280R12C no tiene
+        # binning ni ganancia master.
+        tabla = cam.ajustes()
+        self.spin_gain.config(state="normal" if tabla["ganancia"].activo else "disabled")
+        self.spin_bin.config(state="normal" if tabla["bin_v"].activo else "disabled")
+        avisos = avisos_no_lineales(cam.valores)
+        self.lbl_aviso.config(text="Fuera de la cadena lineal: " + ", ".join(avisos)
+                              if avisos else "")
+
+    def ajuste_aplicado(self, clave: str, res) -> None:
+        """El hilo de captura aplico un ajuste: se sincroniza el resto de la ventana."""
+        if self.cam is None:
+            return
+        self._actualizar_ficha()
+        if isinstance(res, Exception):
+            self.lbl_aviso.config(text=str(res))
+        v = self.cam.valores
+        self.cfg = replace(self.cfg, gain=int(v["ganancia"]), exposure_ms=self.cam.exposure_ms,
+                           binning=min(factor_de_opcion(v["bin_v"]), max(BINNING_MODES)))
+        self.var_gain.set(self.cfg.gain)
+        self.var_bin.set(self.cfg.binning)
+        if clave == "exposicion":
+            self.lbl_exp.config(text=f"exposicion {self.cam.exposure_ms:.2f} ms")
+        else:             # con el dedo en la barra no se la mueve: daria saltos
+            self.var_exp.set(f"{self.cam.exposure_ms:g}")
+            self._rango_exposicion()
 
     def _abrir_camara(self) -> None:
         from tkinter import messagebox
@@ -1116,7 +2419,7 @@ class CamaraGUI:
             if not messagebox.askyesno(
                     "Sin camara",
                     f"{e}\n\n¿Seguir en modo demo?\n\n"
-                    "Podes conectar la camara despues y usar 'Detectar camara ThorCam'."):
+                    f"Podes conectar la camara despues y usar '{TEXTO_DETECTAR}'."):
                 self.lbl_cam.config(text="sin camara", foreground=CYBER["alerta"])
                 return
             self.cfg = replace(self.cfg, demo=True)
@@ -1128,57 +2431,45 @@ class CamaraGUI:
             self.cam = None
 
     def detectar(self) -> None:
-        """Busca camaras DCx enchufadas y engancha la primera que este libre.
+        """Busca camaras de las dos marcas, dice que tipo son y engancha una libre.
 
         Es la salida para el caso normal: se abrio el programa antes de
         prender la camara, o se cambio de puerto. Evita tener que reiniciar.
+
+        La camara propia se cierra primero: abierta, retiene su DLL y la otra no
+        se podria ni cargar (ver _cargar_dll), asi que no se veria la otra marca.
         """
         from tkinter import messagebox
-        estaba = self.corriendo.is_set()
         self.detener()
+        self._cerrar_camara()
         self.btn_detectar.config(state="disabled", text="buscando...")
         self.root.update_idletasks()
         try:
-            camaras = detectar_camaras()
+            camaras = detectar_camaras(self.cfg.driver)
+            detalle = "\n".join(f"  - {describir_camara(c)}" for c in camaras)
+            if not camaras:
+                pista = diagnostico_usb()
+                messagebox.showwarning(
+                    "Deteccion", "Ninguna camara Thorlabs ni uEye responde."
+                    + (f"\n\n{pista}" if pista else ""))
+                self._abrir_camara()
+                return
+            self.cfg = replace(self.cfg, demo=False)
+            try:
+                self._abrir_camara_real()
+            except UC480Error as e:
+                messagebox.showerror("Deteccion", f"Se detecto:\n{detalle}\n\n"
+                                                  f"pero no se pudo abrir: {e}")
+                self.cfg = replace(self.cfg, demo=True)
+                self._abrir_camara()
+                return
+            messagebox.showinfo("Deteccion", f"Conectada:\n{detalle}")
+            self.iniciar()
         except UC480Error as e:
-            self.btn_detectar.config(state="normal", text="Detectar camara ThorCam")
             messagebox.showerror("Deteccion", str(e))
-            if estaba:
-                self.iniciar()
-            return
-        self.btn_detectar.config(state="normal", text="Detectar camara ThorCam")
-
-        if not camaras:
-            messagebox.showwarning(
-                "Deteccion", "El SDK responde pero no hay ninguna camara conectada.\n\n"
-                "Revisa el cable USB y que la camara este prendida.")
-            if estaba:
-                self.iniciar()
-            return
-
-        detalle = "\n".join(
-            f"  - {c['modelo'] or '?'}  serie {c['serie'] or '?'}"
-            f"{'  (en uso)' if c['en_uso'] else ''}" for c in camaras)
-        libres = [c for c in camaras if not c["en_uso"]]
-        if not libres and not self.cfg.demo:
-            # Ya la tenemos abierta nosotros: no hay nada que reconectar.
-            messagebox.showinfo("Deteccion", f"{len(camaras)} camara(s):\n{detalle}")
-            if estaba:
-                self.iniciar()
-            return
-
-        self._cerrar_camara()
-        self.cfg = replace(self.cfg, demo=False)
-        try:
-            self._abrir_camara_real()
-        except UC480Error as e:
-            messagebox.showerror("Deteccion", f"Se detecto:\n{detalle}\n\n"
-                                              f"pero no se pudo abrir: {e}")
-            self.cfg = replace(self.cfg, demo=True)
             self._abrir_camara()
-            return
-        messagebox.showinfo("Deteccion", f"Conectada:\n{detalle}")
-        self.iniciar()
+        finally:
+            self.btn_detectar.config(state="normal", text=TEXTO_DETECTAR)
 
     def aplicar(self) -> None:
         from tkinter import messagebox
@@ -1191,22 +2482,13 @@ class CamaraGUI:
         except (ValueError, TypeError) as e:
             messagebox.showerror("Parametros invalidos", str(e))
             return
-        # El binning y la ganancia se fijan al abrir la camara y el binning
-        # ademas cambia el alto del buffer, asi que hay que reabrirla.
-        reabrir = (nueva.binning, nueva.gain) != (self.cfg.binning, self.cfg.gain)
-        estaba = self.corriendo.is_set()
-        self.detener()
-        self.cfg = nueva
-        if reabrir:
-            self._cerrar_camara()
-            self._abrir_camara()
-        elif self.cam is not None:
-            self.var_exp.set(f"{self.cam.set_exposure(nueva.exposure_ms):g}")
-            self._rango_exposicion()
-        with self.lock:
-            self.frame = None
-        if estaba:
-            self.iniciar()
+        # Sin reabrir la camara: se perderian los demas ajustes de la ventana.
+        if nueva.gain != self.cfg.gain:
+            self.cola.pedir("ganancia", nueva.gain)
+        if nueva.binning != self.cfg.binning:
+            self.cola.pedir("bin_v", f"{nueva.binning}x")
+        self.cola.pedir("exposicion", nueva.exposure_ms)
+        self.cfg = replace(self.cfg, average=nueva.average, roi_radius=nueva.roi_radius)
 
     # --- visor ---
 
@@ -1214,6 +2496,7 @@ class CamaraGUI:
         if self.cam is None or self.corriendo.is_set():
             return
         self.perdidos = self.totales = 0
+        self.cam.reanudar()
         self.corriendo.set()
         self.hilo = threading.Thread(target=self._bucle, daemon=True)
         self.hilo.start()
@@ -1221,6 +2504,8 @@ class CamaraGUI:
 
     def detener(self) -> None:
         self.corriendo.clear()
+        if self.cam is not None:
+            self.cam.cancelar()         # por si esta esperando un trigger externo
         hilo, self.hilo = self.hilo, None
         if hilo is not None:
             hilo.join(timeout=5.0)
@@ -1231,21 +2516,23 @@ class CamaraGUI:
             cam, cfg = self.cam, self.cfg
             if cam is None:
                 return
-            if self.exp_pendiente is not None:
-                ms, self.exp_pendiente = self.exp_pendiente, None
-                try:
-                    self.exp_aplicada = cam.set_exposure(ms)
-                except UC480Error:
-                    pass
+            self.cola.drenar(cam)
             pila = []
             for _ in range(cfg.average):
                 if not self.corriendo.is_set():
                     return
-                self.totales += 1
                 try:
                     pila.append(cam.grab().astype(np.float64))
+                    self.sin_trigger = False
+                except CapturaCancelada:
+                    return
+                except TriggerTimeout:
+                    # Sin pulso no se perdio nada: no cuenta como error de USB.
+                    self.sin_trigger = True
+                    continue
                 except UC480Error:
                     self.perdidos += 1
+                self.totales += 1
             if not pila:
                 continue
             f = np.mean(pila, axis=0)
@@ -1261,6 +2548,7 @@ class CamaraGUI:
             f = self.frame
         if f is not None:
             self._dibujar(f)
+        procesar_ajustes(self)
         self._refrescar_estado()
         self.root.after(self.INTERVALO_MS, self._tick)
 
@@ -1311,9 +2599,11 @@ class CamaraGUI:
         else:
             self.canvas.itemconfigure(self._img_id, image=self.photo)
             self.canvas.coords(self._img_id, ox, oy)
+        recortados = canales_recortados(s) if self.dark_on is False else []
         self.lbl_lectura.config(
             text="\n".join(format_sample(s, self.cfg.decimals, self.cfg.normalize))
-                 + ("\n[FIJADO] click para soltar" if self.fijado else ""))
+                 + ("\n[FIJADO] click para soltar" if self.fijado else "")
+                 + (f"\n{'/'.join(recortados)} en 0: sube el nivel de negro" if recortados else ""))
 
     def _refrescar_estado(self) -> None:
         vivo = self.corriendo.is_set()
@@ -1325,10 +2615,9 @@ class CamaraGUI:
         self.btn_iniciar.config(state="disabled" if vivo or self.cam is None else "normal")
         self.btn_detener.config(state="normal" if vivo else "disabled")
         self.chk_dark.config(state="normal" if self.dark is not None else "disabled")
-        if self.exp_aplicada is not None:
-            ms, self.exp_aplicada = self.exp_aplicada, None
-            self.lbl_exp.config(text=f"exposicion {ms:.2f} ms")
-        if self.totales:
+        if self.sin_trigger:
+            self.lbl_estado.config(text="esperando un pulso de trigger...")
+        elif self.totales:
             self.lbl_estado.config(
                 text=f"USB perdidos {self.perdidos}/{self.totales} "
                      f"({self.perdidos / self.totales * 100:.0f}%)"
@@ -1373,17 +2662,15 @@ class CamaraGUI:
         ms = float(valor)
         self.lbl_exp.config(text=f"exposicion {ms:.2f} ms")
         self.var_exp.set(f"{ms:g}")
-        if self.corriendo.is_set():
-            self.exp_pendiente = ms          # lo aplica el hilo entre frames
-        elif self.cam is not None:
-            real = self.cam.set_exposure(ms)
-            self.lbl_exp.config(text=f"exposicion {real:.2f} ms")
+        self.cola.pedir("exposicion", ms)    # lo aplica el hilo entre frames
 
     def _rango_exposicion(self) -> None:
         """Ajusta la barra al rango que declara la camara abierta."""
         if self.cam is None:
             return
-        lo, hi = self.cam.exposure_range()
+        # De la tabla y no del SDK: el hilo de captura puede estar usando el DLL.
+        rango = self.cam.ajustes()["exposicion"]
+        lo, hi = rango.minimo, rango.maximo
         self._ajustando = True
         try:
             self.slider_exp.config(from_=lo, to=hi)
@@ -1619,7 +2906,7 @@ def _console():
 def _banner(con, cam_info: str) -> None:
     from rich.panel import Panel
     con.print(Panel.fit(
-        "[bold cyan]Camara[/]  ·  fotometria RGB para Thorlabs DCx\n"
+        "[bold cyan]Camara[/]  ·  fotometria RGB para Thorlabs DCx e IDS uEye\n"
         f"[dim]{cam_info}[/]", border_style="cyan"))
 
 
@@ -1778,8 +3065,8 @@ def menu(cfg: Config) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Visor y fotometro RGB para camaras Thorlabs DCx. "
-                    "Sin argumentos abre un menu interactivo.",
+        description="Visor y fotometro RGB para camaras Thorlabs DCx e IDS uEye. "
+                    "Sin argumentos abre la interfaz grafica.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     d = Config()
     p.add_argument("-e", "--exposure-ms", type=float, default=d.exposure_ms)
@@ -1788,8 +3075,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-b", "--binning", type=int, default=d.binning,
                    choices=sorted(BINNING_MODES),
                    help="binning vertical por hardware; sube el SNR")
+    p.add_argument("--driver", default=d.driver, choices=["auto", *sorted(DRIVERS)],
+                   help="con que driver abrir; auto prueba los dos")
+    p.add_argument("--camera-id", type=int, default=d.camera_id,
+                   help="id de la camara; 0 toma la primera libre")
     p.add_argument("-c", "--pixel-clock", type=int, default=d.pixel_clock,
-                   help="MHz, 5..30; 0 usa el valor por defecto del driver")
+                   help="MHz, segun la camara; 0 usa el valor por defecto del driver")
     p.add_argument("-f", "--fps", type=float, default=d.fps, help="0 pide el maximo")
     p.add_argument("--retries", type=int, default=d.retries,
                    help="reintentos ante error de transferencia USB")
@@ -1816,10 +3107,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--self-test", action="store_true", help="corre los tests y sale")
     p.add_argument("--benchmark", action="store_true",
                    help="mide la tasa de error USB y sale")
+    p.add_argument("--detectar", action="store_true",
+                   help="dice que camaras hay conectadas y de que tipo, y sale")
     return p
 
 
-MODE_FLAGS = {"self_test", "benchmark", "viewer", "gui", "menu"}
+MODE_FLAGS = {"self_test", "benchmark", "viewer", "gui", "menu", "detectar"}
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
@@ -1867,6 +3160,17 @@ def main(argv: list[str] | None = None) -> int:
         return pytest.main(["-q", "--no-header", self_path])
 
     cfg = config_from_args(args)
+    if args.detectar:
+        try:
+            camaras = detectar_camaras(cfg.driver)
+        except UC480Error as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        for c in camaras:
+            print(describir_camara(c))
+        if not camaras:
+            print("ninguna camara Thorlabs ni uEye responde. " + diagnostico_usb())
+        return 0 if camaras else 1
     # Sin argumentos abre la interfaz grafica: es lo que ve quien hace doble
     # click en el .exe. El menu de texto queda detras de --menu y el visor de
     # OpenCV detras de --viewer.
@@ -1889,7 +3193,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     with cam:
-        print(f"{cam.model}  {cam.width}x{cam.height}  exp {cam.exposure_ms:.2f} ms  "
+        print(f"{cam.marca} {cam.model}  {cam.width}x{cam.height}  exp {cam.exposure_ms:.2f} ms  "
               f"gain {cfg.gain}  bin {cfg.binning}x")
         run_viewer(cam, cfg, load_dark(cfg.dark_path) if cfg.use_dark else None)
     return 0
@@ -2063,8 +3367,8 @@ def test_capture_dark_promedia_los_frames():
 def test_config_valida_sus_rangos():
     import pytest
     malos = [{"roi_radius": -1}, {"decimals": 9}, {"average": 0}, {"gain": 101},
-             {"pixel_clock": 31}, {"pixel_clock": 4}, {"retries": -1},
-             {"binning": 5}, {"binning": 0}]
+             {"pixel_clock": 501}, {"pixel_clock": -1}, {"retries": -1},
+             {"binning": 5}, {"binning": 0}, {"driver": "basler"}, {"camera_id": -1}]
     for kwargs in malos:
         with pytest.raises(ValueError):
             Config(**kwargs)
@@ -2093,7 +3397,8 @@ def test_info_camaras_traduce_la_lista_del_sdk():
 
     info = _info_camaras(entradas)
     assert info[0] == {"id": 1, "device": 0, "modelo": "DCU224C",
-                       "serie": "4002851234", "en_uso": False}
+                       "serie": "4002851234", "en_uso": False, "driver": "uc480",
+                       "fabricante": "", "marca": MARCA_THORLABS}
     assert (info[1]["modelo"], info[1]["en_uso"]) == ("DCC1545M", True)
 
 
@@ -2104,7 +3409,246 @@ def test_detectar_camaras_devuelve_lista_o_explica_por_que_no():
     except UC480Error as e:
         assert "uc480" in str(e).lower() or "Windows" in str(e)
     else:
-        assert all({"id", "modelo", "serie", "en_uso"} <= set(c) for c in camaras)
+        assert all({"id", "modelo", "serie", "en_uso", "driver", "marca"} <= set(c)
+                   for c in camaras)
+
+
+def test_la_marca_sale_de_lo_que_dice_la_camara_no_del_driver():
+    # Caso real: la uEye de 2008 enlazada al driver de Thorlabs.
+    assert clasificar_marca("IDS GmbH", "C1280R12C", "uc480") == MARCA_IDS
+    assert clasificar_marca("Thorlabs GmbH", "D1280G12C", "uc480") == MARCA_THORLABS
+    # Sin fabricante (camara en uso), solo los prefijos comerciales dicen algo.
+    assert clasificar_marca("", "DCU224C", "uc480") == MARCA_THORLABS
+    assert clasificar_marca("", "UI-1540SE-C", "uc480") == MARCA_IDS
+    # Un codigo de sensor por uc480 no prueba nada: no se inventa la marca.
+    assert clasificar_marca("", "C1280R12C", "uc480") == MARCA_DESCONOCIDA
+    assert clasificar_marca("", "C1280R12C", "ueye") == MARCA_IDS
+
+
+def test_elegir_camara_respeta_driver_id_y_en_uso():
+    uc = {"id": 1, "driver": "uc480", "en_uso": True}
+    ue = {"id": 2, "driver": "ueye", "en_uso": False}
+    camaras = [uc, ue]
+    assert elegir_camara(camaras, Config()) is ue                  # la primera libre
+    assert elegir_camara(camaras, Config(driver="uc480")) is None  # esa esta ocupada
+    assert elegir_camara(camaras, Config(camera_id=2)) is ue
+    assert elegir_camara(camaras, Config(camera_id=9)) is None
+    assert elegir_camara([], Config()) is None
+
+
+def test_open_camera_usa_la_clase_del_driver_detectado(monkeypatch):
+    abiertas = []
+    for driver in DRIVERS:
+        monkeypatch.setitem(CLASES_CAMARA, driver,
+                            lambda cfg, info, d=driver: abiertas.append((d, info["id"])))
+    monkeypatch.setitem(globals(), "detectar_camaras",
+                        lambda _d: [{"id": 7, "driver": "ueye", "en_uso": False}])
+    open_camera(Config())
+    assert abiertas == [("ueye", 7)]
+
+
+def test_sin_camara_el_error_explica_que_ve_windows(monkeypatch):
+    import pytest
+    monkeypatch.setitem(globals(), "detectar_camaras", lambda _d: [])
+    monkeypatch.setitem(globals(), "diagnostico_usb", lambda: "PISTA USB")
+    with pytest.raises(UC480Error, match="PISTA USB"):
+        open_camera(Config())
+
+
+def test_interpretar_pnp_distingue_arranque_fallido_de_ausencia():
+    assert "codigo 43" in interpretar_pnp([r"USB\VID_0000&PID_0002\6&336BE19D&0&2"])
+    assert "driver" in interpretar_pnp([r"USB\VID_1409&PID_1540\6&336BE19D&0&2"])
+    assert "no ve ninguna" in interpretar_pnp([])
+
+
+def test_las_dos_dlls_se_cargan_de_a_una(monkeypatch):
+    """Juntas en un proceso, la segunda falla con WinError 1114."""
+    import pytest
+    if sys.platform != "win32":
+        pytest.skip("solo Windows")
+    cargadas = []
+    monkeypatch.setitem(globals(), "_liberar_dll", lambda: cargadas.append("libera"))
+    monkeypatch.setitem(globals(), "_dll_activa", ("uc480", object()))
+    monkeypatch.setitem(globals(), "_camaras_abiertas", 1)
+    with pytest.raises(UC480Error, match="cierrala"):      # con camara abierta, no
+        _cargar_dll("ueye")
+    assert cargadas == []
+    monkeypatch.setitem(globals(), "_camaras_abiertas", 0)
+    falsa = C.WinDLL
+    monkeypatch.setattr(C, "WinDLL", lambda n: cargadas.append(n) or object())
+    try:
+        _cargar_dll("ueye")
+    finally:
+        C.WinDLL = falsa
+    assert cargadas == ["libera", "uEye_api_64"]
+
+
+def test_opciones_de_mascara_salen_de_lo_que_declara_la_camara():
+    assert opciones_de_mascara(0, FACTORES_V) == ("1x",)            # la C1280R12C
+    assert opciones_de_mascara(0x0015, FACTORES_V) == ("1x", "2x", "3x", "4x")  # DCU224C
+    assert opciones_de_mascara(0x0015, FACTORES_H) == ("1x",)
+    assert opciones_de_mascara(0x0c0f, FACTORES_H) == ("1x", "2x", "4x", "8x")  # C1280R12C
+    assert factor_de_opcion("8x") == 8 and factor_de_opcion(2) == 2
+
+
+def test_canales_recortados_detecta_el_parche_entero_en_cero():
+    img = _flat(0)
+    img[:, :, 1] = 6                 # BGR: lo que entrega la C1280R12C a oscuras
+    assert canales_recortados(sample_patch(img, 4, 4, 2)) == ["R", "B"]
+    assert canales_recortados(sample_patch(_flat(3), 4, 4, 2)) == []
+    # Un solo pixel con señal basta: ya no esta todo por debajo del ADC.
+    img[4, 4, 2] = 5
+    assert canales_recortados(sample_patch(img, 4, 4, 2)) == ["B"]
+
+
+def test_tabla_de_ajustes_cubre_las_siete_pestanas_de_thorcam():
+    tabla = DemoCamera(Config(demo=True)).ajustes()
+    assert {a.pestana for a in tabla.values()} == set(PESTANAS) and len(PESTANAS) == 7
+    assert all(a.activo for a in tabla.values())       # la demo declara todo
+
+
+def test_lo_que_la_camara_no_declara_sale_desactivado():
+    # Las capacidades medidas sobre la uEye C1280R12C.
+    cap = {"master": False, "rgb": True, "color": True, "bin_mask": 0, "sub_mask": 0x0c0f,
+           "features": 0, "gpios": 0, "flash": True, "flash_delay": (40, 4000000, 1),
+           "flash_dur": (40, 4000000, 1), "trigger_delay": (15, 4000000, 1),
+           "borde": (0, 9, 1), "reloj": (5, 43, 1), "fps": (4.9, 14.0, 0.01),
+           "exposicion": (0.07, 99.9, 0.07)}
+    tabla = construir_ajustes(cap, dict(DEFECTOS))
+    for apagado in ("ganancia", "bin_h", "bin_v", "obturador", "log_modo", "gpio1", "pwm_hz"):
+        assert not tabla[apagado].activo, apagado
+    for prendido in ("pixel_clock", "ganancia_r", "sub_h", "flash_modo", "trigger_modo", "borde"):
+        assert tabla[prendido].activo, prendido
+
+
+def test_ajuste_no_soportado_se_rechaza_sin_tocar_el_valor():
+    import pytest
+    cam = DemoCamera(Config(demo=True))
+    cam.cap["master"] = False
+    with pytest.raises(UC480Error, match="no admite"):
+        cam.aplicar_ajuste("ganancia", 50)
+    assert cam.valores["ganancia"] == 0
+    with pytest.raises(ValueError, match="desconocido"):
+        cam.aplicar_ajuste("no_existe", 1)
+
+
+def test_valores_fuera_de_rango_saturan_y_opciones_invalidas_fallan():
+    import pytest
+    cam = DemoCamera(Config(demo=True))
+    assert cam.aplicar_ajuste("ganancia", 500) == 100
+    assert cam.aplicar_ajuste("gamma", 9.0) == 2.2
+    with pytest.raises(ValueError):
+        cam.aplicar_ajuste("trigger_modo", "telepatia")
+
+
+def test_submuestreo_cambia_el_tamano_real_del_frame():
+    cam = DemoCamera(Config(demo=True))
+    cam.aplicar_ajuste("sub_h", "2x")
+    cam.aplicar_ajuste("sub_v", "4x")
+    assert cam.grab().shape[:2] == (480 // 4, 640 // 2)
+    cam.restablecer()
+    assert cam.grab().shape[:2] == (480, 640)
+
+
+def test_espejo_invierte_la_imagen():
+    cam = DemoCamera(Config(demo=True))
+    normal = cam.grab().astype(np.float64)
+    cam.aplicar_ajuste("espejo_lr", True)
+    cam._t = 0
+    espejada = cam.grab().astype(np.float64)
+    cam2 = DemoCamera(Config(demo=True))
+    assert normal.shape == espejada.shape
+    assert np.abs(espejada[:, ::-1] - cam2.grab()).mean() < 1e-9
+
+
+def test_combinar_saturacion_acopla_u_y_v():
+    cam = DemoCamera(Config(demo=True))
+    cam.aplicar_ajuste("sat_u", 150)
+    assert cam.valores["sat_v"] == 150
+    cam.aplicar_ajuste("sat_combinar", False)
+    cam.aplicar_ajuste("sat_u", 80)
+    assert cam.valores["sat_v"] == 150
+
+
+def test_avisa_solo_lo_que_rompe_la_linealidad():
+    """Invariante de la fotometria: multiplicar por una constante sigue siendo lineal."""
+    base = dict(DEFECTOS)
+    assert avisos_no_lineales(base) == []
+    assert avisos_no_lineales({**base, "ganancia": 50, "ganancia_r": 80, "exposicion": 5}) == []
+    for clave, valor in (("gamma", 2.2), ("exp_auto", True), ("awb", True), ("borde", 3),
+                         ("sat_u", 150), ("gain_boost", True), ("negro_auto", True)):
+        assert avisos_no_lineales({**base, clave: valor}), clave
+
+
+def test_restablecer_vuelve_a_la_cadena_lineal():
+    cam = DemoCamera(Config(demo=True))
+    for clave, valor in (("gamma", 2.0), ("awb", True), ("borde", 4), ("exp_auto", True)):
+        cam.aplicar_ajuste(clave, valor)
+    assert avisos_no_lineales(cam.valores)
+    assert cam.restablecer() == []
+    assert avisos_no_lineales(cam.valores) == []
+
+
+def test_perfil_ida_y_vuelta(tmp_path):
+    cam = DemoCamera(Config(demo=True))
+    cam.aplicar_ajuste("ganancia_r", 42)
+    cam.aplicar_ajuste("trigger_modo", "software")
+    cam.aplicar_ajuste("sub_h", "2x")
+    ruta = guardar_perfil(cam, tmp_path / "p.json")
+    otra = DemoCamera(Config(demo=True))
+    assert otra.cargar_valores(leer_perfil(ruta)) == []
+    assert otra.valores["ganancia_r"] == 42
+    assert otra.valores["trigger_modo"] == "software"
+    assert otra.width == cam.width
+
+
+def test_perfil_de_otra_camara_salta_lo_que_esta_no_tiene(tmp_path):
+    cam = DemoCamera(Config(demo=True))
+    cam.aplicar_ajuste("ganancia", 30)
+    ruta = guardar_perfil(cam, tmp_path / "p.json")
+    otra = DemoCamera(Config(demo=True))
+    otra.cap["master"] = False
+    assert otra.cargar_valores(leer_perfil(ruta)) == []
+    assert otra.valores["ganancia"] == 0
+
+
+def test_leer_perfil_rechaza_lo_que_no_es_un_perfil(tmp_path):
+    import pytest
+    malo = tmp_path / "x.json"
+    malo.write_text("[1, 2]")
+    with pytest.raises(ValueError, match="no es un perfil"):
+        leer_perfil(malo)
+
+
+def test_cola_aplica_el_ultimo_pedido_de_cada_clave_y_reporta():
+    cam = DemoCamera(Config(demo=True))
+    cola = ColaAjustes()
+    for g in (10, 20, 30):
+        cola.pedir("ganancia", g)
+    cola.pedir("trigger_modo", "telepatia")
+    assert cola.drenar(cam) is True
+    hechos = dict(cola.hechos())
+    assert hechos["ganancia"] == 30 and cam.valores["ganancia"] == 30
+    assert isinstance(hechos["trigger_modo"], ValueError)
+    assert cola.drenar(cam) is False and cola.hechos() == []
+
+
+def test_cola_restablece_desde_el_hilo_de_captura():
+    cam = DemoCamera(Config(demo=True))
+    cam.aplicar_ajuste("gamma", 2.0)
+    cola = ColaAjustes()
+    cola.pedir(ColaAjustes.RESTABLECER)
+    cola.drenar(cam)
+    assert cam.valores["gamma"] == 1.0
+    assert cola.hechos() == [(ColaAjustes.RESTABLECER, [])]
+
+
+def test_structs_coinciden_con_el_sdk():
+    assert C.sizeof(BOARDINFO) == 64
+    assert C.sizeof(IS_RECT) == 16
+    assert C.sizeof(IO_FLASH_PARAMS) == 8
+    assert C.sizeof(IO_PWM_PARAMS) == 16
+    assert C.sizeof(IO_GPIO_CONFIGURATION) == 64
 
 
 def test_el_modulo_no_depende_de_windows():
@@ -2137,7 +3681,7 @@ def test_cli_expone_binning_y_parametros_de_usb():
 
 
 def test_los_flags_de_modo_no_llegan_a_config():
-    args = build_parser().parse_args(["--viewer", "--benchmark", "--gui", "--menu"])
+    args = build_parser().parse_args(["--viewer", "--benchmark", "--gui", "--menu", "--detectar"])
     cfg = config_from_args(args)              # no debe lanzar TypeError
     assert not any(hasattr(cfg, f) for f in MODE_FLAGS)
 
