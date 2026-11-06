@@ -52,8 +52,8 @@ import numpy as np
 
 from camara import (CYBER, TEXTO_DETECTAR, CapturaCancelada, Camera, ColaAjustes, Config,
                     DRIVERS, FORMATOS, UC480Error, _aplicar_estilo, _ppm, abrir_ajustes,
-                    accion_instalar_drivers, apply_dark, avisos_no_lineales, describir_camara, detectar_camaras,
-                    diagnostico_usb, ficha_camara, load_dark, open_camera,
+                    accion_instalar_drivers, apply_dark, avisar_sin_camara, avisos_no_lineales,
+                    describir_camara, detectar_camaras, ficha_camara, load_dark, open_camera,
                     panel_con_scroll, procesar_ajustes, save_frame_as)
 
 
@@ -538,13 +538,11 @@ class PolarimetroGUI:
         try:
             camaras = detectar_camaras(self.cfg.driver)
         except UC480Error as e:
-            messagebox.showerror("Deteccion", str(e))
+            avisar_sin_camara(self.root, str(e))
             camaras = []
         else:
             if not camaras:
-                pista = diagnostico_usb()
-                messagebox.showwarning("Deteccion", "Ninguna camara Thorlabs ni uEye responde."
-                                       + (f"\n\n{pista}" if pista else ""))
+                avisar_sin_camara(self.root)
         if camaras:
             self.cfg = replace(self.cfg, demo=False)
         self._abrir_camara()

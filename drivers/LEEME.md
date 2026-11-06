@@ -77,6 +77,23 @@ que instala *DCx Camera Support* (la cámara DCU224C está descontinuada desde 2
 no trae una licencia que permita redistribuirlo. Los `.exe` llevan dentro ambos paquetes,
 así que estos avisos también se aplican a ellos.
 
+## Reparar los drivers
+
+Si **Detectar cámara** no encuentra la cámara y Windows muestra un problema de driver,
+el programa dice cuál es, con el código del Administrador de dispositivos y la versión
+del driver, y ofrece dos opciones:
+
+- **Reinstalar los drivers incluidos** (`camara.exe --reparar-drivers`): quita las
+  versiones de uc480 y uEye del PC y deja enlazado uc480, que sirve para las dos marcas.
+  Otro programa de Thorlabs o IDS podría necesitar reinstalarse después.
+- **Buscar en internet** (`camara.exe --buscar-drivers`): busca en Windows Update, con
+  la cámara conectada, y solo instala drivers de estas cámaras (`VID_1409`). Si no hay,
+  abre las descargas oficiales de Thorlabs e IDS para instalarlas a mano: el programa
+  no ejecuta instaladores descargados de otras fuentes. IDS pide una cuenta gratuita.
+
+No se ofrece si el problema es otro: sin cámara visible, o con un dispositivo USB que no
+arrancó (código 43), se indica revisar el cable y el puerto.
+
 ## Si algo falla
 
 - **«No se encontró el SDK»** al abrir el programa: el driver no se instaló, o

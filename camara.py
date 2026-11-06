@@ -50,6 +50,7 @@ import csv
 import ctypes as C
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -303,6 +304,7 @@ class Camera(Protocol):
 _dll_lock = threading.RLock()
 _dll_activa: tuple[str, object] | None = None
 _camaras_abiertas = 0
+_dll_embebidas: set[str] = set()       # drivers que cargaron la copia del programa
 
 
 def _liberar_dll() -> None:
@@ -347,6 +349,7 @@ def _cargar_dll(driver: str = "uc480"):
                 dll = C.WinDLL(str(copia))
             except OSError as e2:
                 raise UC480Error(f"no se pudo cargar {copia.name}: {e2}") from e2
+            _dll_embebidas.add(driver)
         _dll_activa = (driver, dll)
         return dll
 
@@ -413,49 +416,223 @@ def resumir_instalacion(resultados: dict[str, int]) -> str:
     return "\n".join(lineas)
 
 
-def instalar_drivers() -> dict[str, int]:
-    """Instala los paquetes incluidos con pnputil, pidiendo permiso de administrador."""
-    if sys.platform != "win32":
-        raise UC480Error("los drivers solo se instalan en Windows")
+def _infs_incluidos() -> dict[str, Path]:
+    """Los .inf que trae este programa, uc480 primero. Levanta error si no hay ninguno."""
     infs = {k: _dir_drivers() / d["paquete"] / d["inf"] for k, d in DRIVERS.items()}
     infs = {k: inf for k, inf in infs.items() if inf.is_file()}
     if not infs:
         raise UC480Error(f"no se encontraron los paquetes de driver en {_dir_drivers()}")
+    return infs
+
+
+def _ejecutar_elevado(hacer_script, timeout: float) -> dict[str, int]:
+    """Corre un script como administrador y devuelve lo que anoto en su archivo."""
+    if sys.platform != "win32":
+        raise UC480Error("los drivers solo se administran en Windows")
     with tempfile.TemporaryDirectory() as carpeta:
         salida = Path(carpeta) / "resultado.txt"
-        orden = orden_elevada(script_instalacion(infs, salida))
+        orden = orden_elevada(hacer_script(salida))
         try:
             subprocess.run(["powershell", "-NoProfile", "-Command", orden],
-                           capture_output=True, text=True, timeout=600,
+                           capture_output=True, text=True, timeout=timeout,
                            stdin=subprocess.DEVNULL,
                            creationflags=subprocess.CREATE_NO_WINDOW)
         except (OSError, subprocess.SubprocessError) as e:
-            raise UC480Error(f"no se pudo ejecutar el instalador: {e}") from e
+            raise UC480Error(f"no se pudo ejecutar como administrador: {e}") from e
         if not salida.is_file():    # sin resultado: se rechazo el aviso de Windows
-            raise UC480Error("no se instalo: hace falta aceptar el permiso de administrador")
+            raise UC480Error("no se hizo nada: hace falta aceptar el permiso de administrador")
         return leer_resultados(salida.read_text(encoding="ascii"))
 
 
+def instalar_drivers() -> dict[str, int]:
+    """Instala los paquetes incluidos con pnputil, pidiendo permiso de administrador."""
+    infs = _infs_incluidos()
+    return _ejecutar_elevado(lambda salida: script_instalacion(infs, salida), 600)
+
+
+def script_reparacion(infs: dict[str, Path], salida: Path) -> str:
+    """Script que deja los drivers de estas camaras como recien instalados.
+
+    Quita los dispositivos y los paquetes viejos para que Windows no pueda seguir
+    usando uno roto. Solo uc480 se enlaza a la camara, porque es la combinacion
+    probada con ambas marcas; el resto queda disponible sin enlazar. Los paquetes
+    se reconocen por el nombre del .inf: lo demas de pnputil depende del idioma.
+    """
+    def comillas(ruta: Path) -> str:
+        return "'" + str(ruta).replace("'", "''") + "'"
+    lineas = [
+        "$r = @()",
+        "function Paso($nombre, [string[]]$a) {",
+        "  & pnputil.exe @a | Out-Null",
+        '  $script:r += "$nombre=$LASTEXITCODE"',
+        "}",
+        "Get-PnpDevice | Where-Object InstanceId -Match 'VID_1409' | ForEach-Object {",
+        "  Paso \"quitar:$($_.InstanceId)\" @('/remove-device', $_.InstanceId)",
+        "}",
+        '$bloques = ((pnputil.exe /enum-drivers) -join "`n") -split "`n\\s*`n"',
+        "foreach ($b in $bloques) {",
+        "  if ($b -match '(?im):\\s*(uc480|uc480_64|ueye_64)\\.inf\\s*$' -and "
+        "$b -match '(?i)oem\\d+\\.inf') {",
+        "    $oem = $Matches[0]",
+        "    Paso \"borrar:$oem\" @('/delete-driver', $oem, '/uninstall', '/force')",
+        "  }",
+        "}",
+    ]
+    for driver, inf in infs.items():
+        extra = ", '/install'" if driver == "uc480" else ""
+        lineas.append(f"Paso '{driver}' @('/add-driver', {comillas(inf)}{extra})")
+    lineas += ["Paso 'buscar' @('/scan-devices')",
+               f"$r | Set-Content -Encoding ASCII -LiteralPath {comillas(salida)}"]
+    return "\n".join(lineas)
+
+
+def resumir_reparacion(resultados: dict[str, int]) -> tuple[bool, str]:
+    """(si quedo instalado uc480, el driver que se enlaza a la camara; texto)."""
+    instalados = [k for k in DRIVERS
+                  if resultados.get(k) in PNPUTIL_OK or resultados.get(k) == PNPUTIL_REINICIO]
+    borrados = [k for k, rc in resultados.items() if k.startswith("borrar:") and rc == 0]
+    fallidos = [f"{k}={rc}" for k, rc in resultados.items()
+                if rc not in PNPUTIL_OK and rc != PNPUTIL_REINICIO]
+    lineas = [f"Paquetes viejos retirados: {len(borrados)}.",
+              "Instalados: " + (", ".join(instalados) or "ninguno") + "."]
+    if fallidos:
+        lineas.append("Pasos con error: " + "; ".join(fallidos[:6])
+                      + (f" y {len(fallidos) - 6} mas" if len(fallidos) > 6 else ""))
+    if "uc480" not in instalados:
+        lineas.append("No se pudo instalar el driver uc480: toma una captura de este mensaje.")
+        return False, "\n".join(lineas)
+    if PNPUTIL_REINICIO in resultados.values():
+        lineas.append("Reinicia Windows, conecta la camara y pulsa Detectar camara.")
+    else:
+        lineas.append("Desconecta la camara 10 s, vuelvela a conectar y pulsa Detectar camara.")
+    return True, "\n".join(lineas)
+
+
+def reparar_drivers() -> dict[str, int]:
+    """Quita los drivers de estas camaras y reinstala los incluidos."""
+    infs = _infs_incluidos()
+    return _ejecutar_elevado(lambda salida: script_reparacion(infs, salida), 600)
+
+
+# Sin instalador automatico desde estas paginas a proposito: no publican un enlace
+# directo verificable, IDS pide una cuenta, y no se ejecuta como administrador
+# nada descargado de una direccion sin comprobar.
+PAGINAS_DRIVERS = ("https://www.thorlabs.com/software-pages/ThorCam",
+                   "https://en.ids-imaging.com/download-ueye.html")
+
+
+def script_windows_update(salida: Path) -> str:
+    """Busca e instala por Windows Update solo drivers de estas camaras (VID_1409)."""
+    ruta = "'" + str(salida).replace("'", "''") + "'"
+    return "\n".join([
+        "$r = @()",
+        "try {",
+        "  $s = New-Object -ComObject Microsoft.Update.Session",
+        "  $hallados = $s.CreateUpdateSearcher().Search(\"IsInstalled=0 and Type='Driver'\")",
+        "  $u = New-Object -ComObject Microsoft.Update.UpdateColl",
+        "  foreach ($x in $hallados.Updates) {",
+        "    if ($x.DriverHardwareID -match '(?i)vid_1409') {",
+        "      $x.AcceptEula() | Out-Null",
+        "      $u.Add($x) | Out-Null",
+        "    }",
+        "  }",
+        '  $r += "encontrados=$($u.Count)"',
+        "  if ($u.Count -gt 0) {",
+        "    $d = $s.CreateUpdateDownloader(); $d.Updates = $u; $d.Download() | Out-Null",
+        "    $i = $s.CreateUpdateInstaller(); $i.Updates = $u; $res = $i.Install()",
+        '    $r += "resultado=$([int]$res.ResultCode)"',
+        '    $r += "reinicio=$([int]$res.RebootRequired)"',
+        "  }",
+        "} catch {",
+        '  $r += "error=1"',
+        "}",
+        f"$r | Set-Content -Encoding ASCII -LiteralPath {ruta}",
+    ])
+
+
+def resumir_busqueda(res: dict[str, int]) -> tuple[bool, str]:
+    """(si se instalo algo, texto). ResultCode de Windows Update: 2 exito, 3 parcial."""
+    if res.get("error"):
+        return False, "No se pudo consultar Windows Update (revisa la conexion a internet)."
+    if not res.get("encontrados"):
+        return False, "Windows Update no tiene drivers para esta camara."
+    if res.get("resultado") not in (2, 3):
+        return False, (f"Windows Update encontro {res['encontrados']} driver(s), pero la "
+                       f"instalacion fallo (codigo {res.get('resultado')}).")
+    fin = ("Reinicia Windows." if res.get("reinicio")
+           else "Reconecta la camara y pulsa Detectar camara.")
+    return True, f"Windows Update instalo {res['encontrados']} driver(s). {fin}"
+
+
+def buscar_drivers_en_internet() -> tuple[bool, str]:
+    """Prueba Windows Update; si no resuelve, abre las descargas oficiales."""
+    import webbrowser
+    ok, texto = resumir_busqueda(_ejecutar_elevado(script_windows_update, 1800))
+    if ok:
+        return ok, texto
+    for pagina in PAGINAS_DRIVERS:
+        webbrowser.open(pagina)
+    return False, (f"{texto}\n\nSe abrieron las descargas oficiales en el navegador: "
+                   "instala ThorCam de Thorlabs o, con una cuenta gratuita, IDS Software "
+                   "Suite. Despues pulsa Detectar camara.")
+
+
+def _en_segundo_plano(root, titulo: str, trabajo) -> None:
+    """Corre trabajo() -> (ok, texto) en un hilo, sin congelar la ventana."""
+    from tkinter import messagebox
+
+    def fin(ok: bool, texto: str) -> None:
+        (messagebox.showinfo if ok else messagebox.showerror)(titulo, texto)
+
+    def correr() -> None:
+        try:
+            ok, texto = trabajo()
+        except UC480Error as e:
+            ok, texto = False, str(e)
+        root.after(0, lambda: fin(ok, texto))
+
+    threading.Thread(target=correr, daemon=True).start()
+
+
 def accion_instalar_drivers(root) -> None:
-    """Boton de las dos GUIs. Espera en un hilo para no congelar la ventana."""
+    """Boton de las dos GUIs."""
     from tkinter import messagebox
     if not messagebox.askyesno(
             "Instalar drivers", "Se instalaran los drivers USB de Thorlabs e IDS. "
             "Windows pedira permiso de administrador.\n\nContinuar?"):
         return
 
-    def fin(ok: bool, texto: str) -> None:
-        (messagebox.showinfo if ok else messagebox.showerror)("Instalar drivers", texto)
+    def trabajo() -> tuple[bool, str]:
+        texto = resumir_instalacion(instalar_drivers())
+        return "No se instalo" not in texto, texto
 
-    def trabajo() -> None:
-        try:
-            res = resumir_instalacion(instalar_drivers())
-            root.after(0, lambda: fin("No se instalo" not in res, res))
-        except UC480Error as e:
-            msg = str(e)
-            root.after(0, lambda: fin(False, msg))
+    _en_segundo_plano(root, "Instalar drivers", trabajo)
 
-    threading.Thread(target=trabajo, daemon=True).start()
+
+def avisar_sin_camara(root, detalle: str = "") -> None:
+    """Dice que ve Windows y, si es un problema de drivers, ofrece resolverlo."""
+    from tkinter import messagebox
+    base = detalle or "Ninguna camara Thorlabs ni uEye responde."
+    texto, reparable = diagnosticar_usb()
+    mensaje = f"{base}\n\n{texto}" if texto else base
+    if not reparable:
+        messagebox.showwarning("Deteccion", mensaje)
+        return
+    eleccion = messagebox.askyesnocancel(
+        "Problema con el driver",
+        f"{mensaje}\n\n"
+        "Si: reinstalar los drivers incluidos. Quita primero las versiones de uc480 y "
+        "uEye de este PC; otro programa de Thorlabs o IDS podria necesitar reinstalarse.\n\n"
+        "No: buscar drivers en internet (Windows Update y descargas oficiales).\n\n"
+        "Cancelar: no hacer nada.\n\n"
+        "Windows pedira permiso de administrador.")
+    if eleccion is None:
+        return
+    if eleccion:
+        _en_segundo_plano(root, "Reinstalar drivers",
+                          lambda: resumir_reparacion(reparar_drivers()))
+    else:
+        _en_segundo_plano(root, "Buscar drivers", buscar_drivers_en_internet)
 
 
 class UC480_CAMERA_INFO(C.Structure):
@@ -615,40 +792,104 @@ def describir_camara(c: dict) -> str:
             f"(driver {c['driver']})" + ("  [en uso]" if c["en_uso"] else ""))
 
 
-def interpretar_pnp(lineas: list[str]) -> str:
-    """Traduce el estado USB de Windows a una pista, cuando el SDK no ve nada.
+# Codigos del Administrador de dispositivos que suelen aparecer con estos drivers.
+PROBLEMAS_PNP = {10: "el driver no pudo iniciar el dispositivo",
+                 28: "no tiene driver instalado",
+                 31: "Windows no pudo cargar el driver",
+                 39: "Windows no pudo cargar el driver",
+                 43: "el dispositivo dejo de responder",
+                 48: "Windows bloqueo el driver",
+                 52: "Windows rechazo la firma del driver"}
 
-    El SDK no distingue "no hay camara" de "la camara fallo al arrancar". Windows
-    si: un USB\\VID_0000&PID_0002 es un dispositivo que no respondio al pedido de
-    descriptor (codigo 43), que es como queda una camara cuyo arranque de firmware
-    fallo. Solo es una pista: puede ser otro aparato.
+
+def parsear_dispositivos(lineas: list[str]) -> list[dict]:
+    """Lee las lineas 'instancia|codigo|servicio|version' de la consulta a Windows."""
+    dispositivos = []
+    for linea in lineas:
+        partes = linea.strip().split("|")
+        if len(partes) != 4 or not partes[1].isdigit():
+            continue
+        instancia = partes[0].upper()
+        pid = instancia.partition("PID_")[2][:4]
+        dispositivos.append({"instancia": instancia, "pid": pid, "problema": int(partes[1]),
+                             "servicio": partes[2], "version": partes[3]})
+    return dispositivos
+
+
+def interpretar_dispositivos(dispositivos: list[dict],
+                             pids_incluidos: frozenset[str] = frozenset()) -> tuple[str, bool]:
+    """Traduce el estado USB a (explicacion, si reparar los drivers puede resolverlo).
+
+    El SDK no distingue "no hay camara" de "la camara tiene mal el driver". Windows
+    si, con el codigo de cada dispositivo. Un USB\\VID_0000&PID_0002 no respondio al
+    pedido de descriptor (codigo 43), que es como queda una camara cuyo arranque de
+    firmware fallo: es el enlace USB, y reinstalar drivers no lo arregla.
     """
-    texto = "\n".join(lineas).upper()
-    if "VID_0000&PID_000" in texto:
-        return ("Windows ve un dispositivo USB que no arranco (codigo 43). Si es la "
-                "camara, desconectala unos 10 s y probala en otro puerto o con otro "
-                "cable: es un problema del enlace, no del programa.")
-    if "VID_1409" in texto:
-        return ("Windows ve una camara IDS/Thorlabs, pero el SDK no la lista. Si no "
-                "tiene driver, pulsa Instalar drivers; si lo tiene, revisa que otro "
-                "programa no la tenga tomada.")
-    return "Windows no ve ninguna camara en el USB: revisa el cable y el puerto."
+    camaras = [d for d in dispositivos if "VID_1409" in d["instancia"]]
+    if not camaras:
+        if dispositivos:
+            return ("Windows ve un dispositivo USB que no arranco (codigo 43). Si es la "
+                    "camara, desconectala unos 10 s y probala en otro puerto o con otro "
+                    "cable: es un problema del enlace, no del programa."), False
+        return "Windows no ve ninguna camara en el USB: revisa el cable y el puerto.", False
+    lineas = []
+    for d in camaras:
+        if d["problema"]:
+            causa = PROBLEMAS_PNP.get(d["problema"], "Windows informa un error")
+            lineas.append(f"PID {d['pid']}: {causa} (codigo {d['problema']}).")
+            if d["problema"] == 28 and pids_incluidos and d["pid"] not in pids_incluidos:
+                lineas.append("Los drivers incluidos no cubren este modelo: "
+                              "busca drivers en internet.")
+        else:
+            lineas.append(f"PID {d['pid']}: driver {d['servicio'] or '?'} "
+                          f"{d['version'] or '?'} activo.")
+            if d["pid"] == "1000":
+                lineas.append("La camara sigue en modo de arranque: el firmware no subio.")
+    if not any(d["problema"] for d in camaras) and not any(d["pid"] == "1000" for d in camaras):
+        lineas.append("El driver funciona, pero la API no lista la camara. Cierra ThorCam o "
+                      "uEye Cockpit; si sigue, la DLL y el driver pueden no coincidir.")
+    return "\n".join(lineas), True
 
 
-def diagnostico_usb() -> str:
-    """Le pregunta a Windows que hay en el USB. Vacio si no se puede saber."""
+def _pids_incluidos() -> frozenset[str]:
+    """Los modelos USB que declaran los .inf incluidos. Vacio si no se pueden leer."""
+    pids: set[str] = set()
+    for d in DRIVERS.values():
+        try:
+            texto = (_dir_drivers() / d["paquete"] / d["inf"]).read_text(encoding="latin-1")
+        except OSError:
+            continue
+        pids.update(p.upper() for p in re.findall(r"VID_1409&PID_([0-9A-Fa-f]{4})", texto))
+    return frozenset(pids)
+
+
+def diagnosticar_usb() -> tuple[str, bool]:
+    """Le pregunta a Windows que hay en el USB. Texto vacio si no se puede saber."""
     if sys.platform != "win32":
-        return ""
+        return "", False
     orden = ("Get-PnpDevice -PresentOnly | Where-Object InstanceId -Match "
-             "'VID_1409|VID_0000&PID_000' | ForEach-Object InstanceId")
+             "'VID_1409|VID_0000&PID_000' | ForEach-Object { "
+             "$v = (Get-PnpDeviceProperty -InstanceId $_.InstanceId "
+             "-KeyName DEVPKEY_Device_DriverVersion).Data; "
+             "'{0}|{1}|{2}|{3}' -f $_.InstanceId, [int]$_.ConfigManagerErrorCode, "
+             "$_.Service, $v }")
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-Command", orden],
-                           capture_output=True, text=True, timeout=10,
+                           capture_output=True, text=True, timeout=20,
                            stdin=subprocess.DEVNULL,
                            creationflags=subprocess.CREATE_NO_WINDOW)
     except (OSError, subprocess.SubprocessError):
-        return ""
-    return interpretar_pnp(r.stdout.splitlines())
+        return "", False
+    texto, reparable = interpretar_dispositivos(parsear_dispositivos(r.stdout.splitlines()),
+                                                _pids_incluidos())
+    if reparable and _dll_embebidas:
+        texto += "\nDLL embebida en uso: " + ", ".join(sorted(_dll_embebidas)) + "."
+    return texto, reparable
+
+
+def diagnostico_usb() -> str:
+    """Solo la explicacion, para los mensajes de error."""
+    return diagnosticar_usb()[0]
 
 
 # --- ajustes de camara ------------------------------------------------------
@@ -2571,10 +2812,7 @@ class CamaraGUI:
             camaras = detectar_camaras(self.cfg.driver)
             detalle = "\n".join(f"  - {describir_camara(c)}" for c in camaras)
             if not camaras:
-                pista = diagnostico_usb()
-                messagebox.showwarning(
-                    "Deteccion", "Ninguna camara Thorlabs ni uEye responde."
-                    + (f"\n\n{pista}" if pista else ""))
+                avisar_sin_camara(self.root)
                 self._abrir_camara()
                 return
             self.cfg = replace(self.cfg, demo=False)
@@ -2589,7 +2827,7 @@ class CamaraGUI:
             messagebox.showinfo("Deteccion", f"Conectada:\n{detalle}")
             self.iniciar()
         except UC480Error as e:
-            messagebox.showerror("Deteccion", str(e))
+            avisar_sin_camara(self.root, str(e))
             self._abrir_camara()
         finally:
             self.btn_detectar.config(state="normal", text=TEXTO_DETECTAR)
@@ -3234,11 +3472,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="dice que camaras hay conectadas y de que tipo, y sale")
     p.add_argument("--instalar-drivers", action="store_true",
                    help="instala los drivers USB incluidos (pide administrador) y sale")
+    p.add_argument("--reparar-drivers", action="store_true",
+                   help="quita los drivers de estas camaras y reinstala los incluidos "
+                        "(pide administrador) y sale")
+    p.add_argument("--buscar-drivers", action="store_true",
+                   help="busca drivers en Windows Update y, si no hay, abre las "
+                        "descargas oficiales (pide administrador) y sale")
     return p
 
 
 MODE_FLAGS = {"self_test", "benchmark", "viewer", "gui", "menu", "detectar",
-              "instalar_drivers"}
+              "instalar_drivers", "reparar_drivers", "buscar_drivers"}
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
@@ -3294,6 +3538,14 @@ def main(argv: list[str] | None = None) -> int:
         print(resumir_instalacion(resultados))
         return 0 if any(rc in PNPUTIL_OK or rc == PNPUTIL_REINICIO
                         for rc in resultados.values()) else 1
+    if args.reparar_drivers or args.buscar_drivers:
+        try:
+            ok, texto = (resumir_reparacion(reparar_drivers()) if args.reparar_drivers
+                         else buscar_drivers_en_internet())
+        except UC480Error as e:
+            ok, texto = False, f"error: {e}"
+        print(texto)
+        return 0 if ok else 1
 
     cfg = config_from_args(args)
     if args.detectar:
@@ -3591,10 +3843,128 @@ def test_sin_camara_el_error_explica_que_ve_windows(monkeypatch):
         open_camera(Config())
 
 
-def test_interpretar_pnp_distingue_arranque_fallido_de_ausencia():
-    assert "codigo 43" in interpretar_pnp([r"USB\VID_0000&PID_0002\6&336BE19D&0&2"])
-    assert "driver" in interpretar_pnp([r"USB\VID_1409&PID_1540\6&336BE19D&0&2"])
-    assert "no ve ninguna" in interpretar_pnp([])
+def _estado(*lineas: str) -> tuple[str, bool]:
+    return interpretar_dispositivos(parsear_dispositivos(list(lineas)),
+                                    frozenset({"1000", "2240"}))
+
+
+def test_el_diagnostico_separa_enlace_usb_de_problema_de_driver():
+    # Reinstalar drivers no arregla el enlace ni una camara que no esta.
+    texto, reparable = _estado(r"USB\VID_0000&PID_0002\6&3&0&2|43||")
+    assert "codigo 43" in texto and not reparable
+    texto, reparable = _estado()
+    assert "no ve ninguna" in texto and not reparable
+
+
+def test_el_diagnostico_nombra_cada_problema_de_driver():
+    texto, reparable = _estado(r"USB\VID_1409&PID_2240\6&3&0&2|28||")
+    assert "no tiene driver" in texto and reparable and "internet" not in texto
+    texto, reparable = _estado(r"USB\VID_1409&PID_2240\6&3&0&2|52|uEye|4.2.11.0")
+    assert "firma" in texto and reparable
+    texto, reparable = _estado(r"USB\VID_1409&PID_2240\6&3&0&2|99|uc480|4.80.5.0")
+    assert "codigo 99" in texto and reparable
+
+
+def test_un_modelo_sin_driver_incluido_lleva_a_internet():
+    texto, reparable = _estado(r"USB\VID_1409&PID_1100\6&3&0&2|28||")
+    assert "internet" in texto and reparable
+
+
+def test_driver_activo_sin_lista_no_se_confunde_con_falta_de_driver():
+    texto, reparable = _estado(r"USB\VID_1409&PID_2240\6&3&0&2|0|uc480|4.80.5.0")
+    assert "uc480 4.80.5.0 activo" in texto and "no lista" in texto and reparable
+    texto, reparable = _estado(r"USB\VID_1409&PID_1000\6&3&0&2|0|uc480_boot|4.80.5.0")
+    assert "modo de arranque" in texto and "no lista" not in texto and reparable
+
+
+def test_los_paquetes_incluidos_declaran_la_camara_de_referencia():
+    assert {"1000", "2240", "1540"} <= _pids_incluidos()
+
+
+def test_la_reparacion_borra_antes_de_instalar_y_solo_enlaza_uc480(tmp_path):
+    infs = {"uc480": Path("C:/d'A/uc.inf"), "ueye": Path("C:/ue.inf")}
+    script = script_reparacion(infs, tmp_path / "r.txt")
+    assert "d''A" in script
+    assert script.index("/remove-device") < script.index("/delete-driver")
+    assert script.index("/delete-driver") < script.index("Paso 'uc480'")
+    assert "Paso 'uc480' @('/add-driver', 'C:\\d''A\\uc.inf', '/install')" in script.replace(
+        "/", "\\").replace("\\add-driver", "/add-driver").replace("\\install", "/install")
+    linea_ueye = next(ln for ln in script.splitlines() if ln.startswith("Paso 'ueye'"))
+    assert "/install" not in linea_ueye
+
+
+def test_el_resumen_de_reparacion_dice_si_quedo_algun_driver():
+    ok, texto = resumir_reparacion({"borrar:oem1.inf": 0, "uc480": 259, "ueye": 0, "buscar": 0})
+    assert ok and "retirados: 1" in texto and "vuelvela a conectar" in texto
+    ok, texto = resumir_reparacion({"uc480": 3010})
+    assert ok and "Reinicia" in texto
+    ok, texto = resumir_reparacion({"uc480": 5, "ueye": 5})
+    assert not ok and "uc480=5" in texto
+    # uEye solo queda disponible, sin enlazar: no reemplaza a uc480.
+    ok, texto = resumir_reparacion({"borrar:oem1.inf": 5, "uc480": 5, "ueye": 0})
+    assert not ok and "retirados: 0" in texto
+
+
+def _dialogo_falso(monkeypatch, eleccion, reparable=True):
+    """Reemplaza las ventanas y devuelve lo que se mostro y lo que se ejecuto."""
+    import tkinter.messagebox as mb
+    hechos = []
+    monkeypatch.setitem(globals(), "diagnosticar_usb", lambda: ("DIAGNOSTICO", reparable))
+    monkeypatch.setitem(globals(), "reparar_drivers",
+                        lambda: hechos.append("reparar") or {"uc480": 259})
+    monkeypatch.setitem(globals(), "buscar_drivers_en_internet",
+                        lambda: hechos.append("buscar") or (False, "sin resultados"))
+    monkeypatch.setattr(mb, "askyesnocancel", lambda _t, m: hechos.append(m) or eleccion)
+    for nombre in ("showinfo", "showerror", "showwarning"):
+        monkeypatch.setattr(mb, nombre, lambda _t, m, n=nombre: hechos.append((n, m)))
+    return hechos
+
+
+class _RootFalso:
+    def __init__(self):
+        self.fin = threading.Event()
+
+    def after(self, _ms, funcion):
+        funcion()
+        self.fin.set()
+
+
+def test_el_dialogo_de_driver_ejecuta_lo_que_se_elige(monkeypatch):
+    hechos = _dialogo_falso(monkeypatch, None)
+    avisar_sin_camara(_RootFalso())
+    assert "DIAGNOSTICO" in hechos[0] and len(hechos) == 1        # Cancelar no hace nada
+
+    hechos = _dialogo_falso(monkeypatch, True)
+    root = _RootFalso()
+    avisar_sin_camara(root)
+    assert root.fin.wait(5)
+    assert hechos[1] == "reparar" and hechos[2][0] == "showinfo"
+
+    hechos = _dialogo_falso(monkeypatch, False)
+    root = _RootFalso()
+    avisar_sin_camara(root)
+    assert root.fin.wait(5)
+    assert hechos[1] == "buscar" and hechos[2][0] == "showerror"
+
+
+def test_sin_problema_de_driver_no_ofrece_reparar(monkeypatch):
+    hechos = _dialogo_falso(monkeypatch, True, reparable=False)
+    avisar_sin_camara(_RootFalso())
+    assert hechos[0][0] == "showwarning" and "reparar" not in hechos
+
+
+def test_windows_update_solo_toca_drivers_de_estas_camaras(tmp_path):
+    script = script_windows_update(tmp_path / "r.txt")
+    assert "vid_1409" in script and "$u.Add($x)" in script
+    assert script.index("vid_1409") < script.index("$u.Add($x)")
+
+
+def test_el_resumen_de_busqueda_cubre_cada_resultado():
+    assert not resumir_busqueda({"error": 1})[0]
+    assert "no tiene drivers" in resumir_busqueda({"encontrados": 0})[1]
+    assert not resumir_busqueda({"encontrados": 1, "resultado": 4})[0]
+    ok, texto = resumir_busqueda({"encontrados": 1, "resultado": 2, "reinicio": 1})
+    assert ok and "Reinicia" in texto
 
 
 def test_las_dos_dlls_se_cargan_de_a_una(monkeypatch):

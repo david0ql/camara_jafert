@@ -38,7 +38,8 @@ hay que registrar el driver en Windows una vez por PC:
    como administrador.
 2. Conectar la cámara y pulsar **Detectar cámara**.
 
-Detalles y licencia en [`drivers/LEEME.md`](drivers/LEEME.md).
+Si hay un problema de driver, **Detectar cámara** explica cuál es y ofrece reinstalar
+los drivers o buscarlos en internet. Detalles y licencia en [`drivers/LEEME.md`](drivers/LEEME.md).
 
 ---
 
