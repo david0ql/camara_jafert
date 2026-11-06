@@ -1,33 +1,44 @@
 # Drivers de la cámara (Thorlabs DCx / IDS uEye)
 
-Los programas de `dist/` hablan con la cámara a través de un driver USB, que puede
-ser el de Thorlabs o el de IDS. Basta con instalar uno:
+`camara.exe` y `polarimetro.exe` traen dentro las DLL y los paquetes de driver de
+Thorlabs e IDS, así que no hace falta descargar nada. Lo único que hay que hacer en
+un PC nuevo es registrar el driver en Windows, una vez, con **una** de estas opciones:
 
-| Instalador | Driver | De dónde salen los archivos |
-|---|---|---|
-| [`Instalar_driver_ThorCam.bat`](Instalar_driver_ThorCam.bat) | Thorlabs DCx (uc480) 4.80.5 | `DCx_USB_Driver_Package/`, incluido en este repositorio |
-| [`Instalar_driver_uEye.bat`](Instalar_driver_uEye.bat) | IDS uEye | el SDK de IDS ya instalado en el PC; no se incluye aquí |
+| Opción | Qué instala |
+|---|---|
+| Botón **Instalar drivers** de cualquiera de los dos programas | Thorlabs e IDS |
+| [`Instalar_driver_ThorCam.bat`](Instalar_driver_ThorCam.bat) | Thorlabs DCx (uc480) 4.80.5, desde `DCx_USB_Driver_Package/` |
+| [`Instalar_driver_uEye.bat`](Instalar_driver_uEye.bat) | IDS uEye: el SDK de IDS del PC si lo hay; si no, 4.2.11 desde `uEye_USB_Driver_Package/` |
 
-Sirven para cualquiera de las dos marcas. Si no hay un motivo para preferir el de
-IDS, lo más directo es el de ThorCam, que no requiere descargar nada.
+Cualquiera de los dos drivers sirve para las dos marcas.
 
 ## Instalación rápida
 
-1. Con la cámara **desconectada**, click derecho en el instalador elegido →
-   **Ejecutar como administrador**. Ambos ejecutan `pnputil /add-driver … /install`
-   sobre el `.inf` del driver.
+1. Con la cámara **desconectada**, pulsar **Instalar drivers** y aceptar el permiso de
+   administrador de Windows. Con un `.bat`: click derecho → **Ejecutar como
+   administrador**. Por dentro es `pnputil /add-driver … /install` sobre cada `.inf`.
 2. Conectar la cámara por USB. En el Administrador de dispositivos debe aparecer
    bajo *Cámaras uEye* / *Thorlabs DCx*, sin signo de advertencia.
-3. Abrir `camara.exe` o `polarimetro.exe`: detecta la cámara sola y muestra de qué
-   tipo es (Thorlabs o IDS uEye), con modelo y número de serie. **Detectar cámara**
-   vuelve a buscar sin reiniciar.
+3. Pulsar **Detectar cámara**: muestra de qué tipo es (Thorlabs o IDS uEye), con
+   modelo y número de serie.
+
+## Por qué no basta con la DLL
+
+La DLL es la API que cargan los programas, y el driver de kernel es el que le habla al
+USB y le sube el firmware a la cámara. Hacen falta los dos:
+
+- **DLL:** los programas usan la de `System32` si existe, porque coincide con el driver
+  instalado; si no, la copia embebida. El `.inf` solo la copia a `System32` cuando
+  Windows instala la cámara, no al registrar el driver sin ella conectada.
+- **Driver de kernel:** solo se puede instalar con permiso de administrador. Sin él,
+  la cámara aparece como dispositivo desconocido aunque la DLL cargue.
 
 ## Driver de IDS uEye
 
-`Instalar_driver_uEye.bat` busca
-`C:\Program Files\IDS\uEye\USB driver package\ueye_64.inf`. Si no está, indica dónde
-descargar [IDS Software Suite](https://en.ids-imaging.com/downloads.html). El driver
-de IDS debe ser de 64 bits, igual que los programas.
+El paquete 4.2.11 es de 2012 y no tiene firma WHQL de Microsoft, solo la de IDS. Windows
+podría rechazarlo con *Integridad de memoria* activa; en ese caso el driver de Thorlabs
+sigue sirviendo. Para una versión más nueva, instalar
+[IDS Software Suite](https://en.ids-imaging.com/downloads.html).
 
 Windows enlaza el mismo identificador USB (`VID_1409`) a uc480 o a uEye y elige el
 driver mejor clasificado, así que con ambos instalados puede seguir usando uc480 aunque
@@ -62,8 +73,9 @@ laboratorio, pero este repositorio es público, así que conviene reemplazarlos 
 enlace a la [descarga oficial de ThorCam](https://www.thorlabs.com/software-pages/ThorCam),
 que instala *DCx Camera Support* (la cámara DCU224C está descontinuada desde 2021).
 
-Por eso el driver de IDS no se incluye: `Instalar_driver_uEye.bat` usa la copia
-instalada en cada PC.
+`uEye_USB_Driver_Package/` es software de IDS, copiado de una instalación de su SDK, y
+no trae una licencia que permita redistribuirlo. Los `.exe` llevan dentro ambos paquetes,
+así que estos avisos también se aplican a ellos.
 
 ## Si algo falla
 

@@ -52,7 +52,7 @@ import numpy as np
 
 from camara import (CYBER, TEXTO_DETECTAR, CapturaCancelada, Camera, ColaAjustes, Config,
                     DRIVERS, FORMATOS, UC480Error, _aplicar_estilo, _ppm, abrir_ajustes,
-                    apply_dark, avisos_no_lineales, describir_camara, detectar_camaras,
+                    accion_instalar_drivers, apply_dark, avisos_no_lineales, describir_camara, detectar_camaras,
                     diagnostico_usb, ficha_camara, load_dark, open_camera,
                     panel_con_scroll, procesar_ajustes, save_frame_as)
 
@@ -380,6 +380,8 @@ class PolarimetroGUI:
                                    wraplength=280, foreground=CYBER["alerta"])
         self.lbl_aviso.pack(anchor="w")
         ttk.Button(f, text=TEXTO_DETECTAR, command=self.detectar).pack(fill="x", pady=(6, 0))
+        ttk.Button(f, text="Instalar drivers",
+                   command=lambda: accion_instalar_drivers(self.root)).pack(fill="x", pady=(4, 0))
         ttk.Button(f, text="Ajustes de camara...",
                    command=lambda: abrir_ajustes(self.root, self)).pack(fill="x", pady=(4, 0))
         fila = ttk.Frame(f)

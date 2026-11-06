@@ -29,13 +29,14 @@ instalar Python ni `uv`:
 | Polarímetro | [`dist/polarimetro.exe`](dist/polarimetro.exe) |
 
 Doble click abre la interfaz; con `--demo` funcionan sin cámara. Para usar una
-cámara real hace falta un driver USB; cualquiera de los dos sirve para ambas marcas.
-Ejecutar uno de estos como administrador y conectar la cámara:
+cámara real, los dos programas traen dentro todo lo necesario de Thorlabs e IDS; solo
+hay que registrar el driver en Windows una vez por PC:
 
-| Driver | Instalador | Requisito |
-|---|---|---|
-| Thorlabs DCx | [`drivers/Instalar_driver_ThorCam.bat`](drivers/Instalar_driver_ThorCam.bat) | ninguno, el driver va incluido |
-| IDS uEye | [`drivers/Instalar_driver_uEye.bat`](drivers/Instalar_driver_uEye.bat) | tener instalado el SDK de IDS |
+1. Con la cámara desconectada, pulsar **Instalar drivers** y aceptar el permiso de
+   administrador. También sirven [`drivers/Instalar_driver_ThorCam.bat`](drivers/Instalar_driver_ThorCam.bat)
+   o [`drivers/Instalar_driver_uEye.bat`](drivers/Instalar_driver_uEye.bat), ejecutados
+   como administrador.
+2. Conectar la cámara y pulsar **Detectar cámara**.
 
 Detalles y licencia en [`drivers/LEEME.md`](drivers/LEEME.md).
 
@@ -390,8 +391,11 @@ Para distribuir el visor a una maquina sin `uv` ni Python, se empaqueta con
 
 ```bash
 pip install numpy opencv-python questionary rich pytest pyinstaller
-pyinstaller --onefile --name camara --windowed --add-data "camara.py;." camara.py
-pyinstaller --onefile --name polarimetro --windowed \
+PAQUETES='--add-data drivers/DCx_USB_Driver_Package;drivers/DCx_USB_Driver_Package
+          --add-data drivers/uEye_USB_Driver_Package;drivers/uEye_USB_Driver_Package'
+pyinstaller --clean --onefile --name camara --windowed $PAQUETES \
+            --add-data "camara.py;." camara.py
+pyinstaller --clean --onefile --name polarimetro --windowed $PAQUETES \
             --add-data "polarimetro.py;." --add-data "camara.py;." polarimetro.py
 ```
 
@@ -411,8 +415,12 @@ Dos detalles del empaquetado:
   propio archivo fuente, y PyInstaller no lo deja en disco a menos que se
   declare explícitamente como dato.
 
-La captura real sigue necesitando el SDK de Thorlabs o de IDS instalado en esa
-maquina — el `.exe` no lo embebe, igual que no lo instala `uv run`.
+- Los `--add-data` de `drivers/` embeben las DLL y los paquetes de driver, para que
+  el botón **Instalar drivers** funcione sin nada más. `--clean` evita que PyInstaller
+  reutilice un `.exe` anterior.
+
+La captura real necesita además registrar el driver en esa máquina, una vez y con
+permiso de administrador: **Instalar drivers**, o `camara.exe --instalar-drivers`.
 
 ## Nota sobre el enlace USB
 

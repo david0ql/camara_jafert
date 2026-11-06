@@ -45,12 +45,14 @@ la capa de camara, el guardado y el estilo de la interfaz.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import ctypes as C
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -142,9 +144,11 @@ PIXEL_CLOCKS = (12, 16, 20, 24, 30)  # MHz, los que barre el diagnostico USB
 # Las dos APIs exportan las mismas funciones; solo cambia que DLL se carga.
 DRIVERS = {
     "uc480": {"dll": "uc480_64", "dll32": "uc480",
-              "sdk": "DCx Camera Support (Thorlabs)"},
+              "sdk": "DCx Camera Support (Thorlabs)",
+              "paquete": "DCx_USB_Driver_Package", "inf": "uc480_64.inf"},
     "ueye": {"dll": "uEye_api_64", "dll32": "uEye_api",
-             "sdk": "IDS Software Suite (uEye)"},
+             "sdk": "IDS Software Suite (uEye)",
+             "paquete": "uEye_USB_Driver_Package", "inf": "ueye_64.inf"},
 }
 
 
@@ -330,12 +334,128 @@ def _cargar_dll(driver: str = "uc480"):
                     "cierrala antes de usar el otro driver")
             _liberar_dll()
         nombre = d["dll"] if sys.maxsize > 2 ** 32 else d["dll32"]
+        # Primero la del sistema, que coincide con el driver de kernel instalado.
+        # La embebida va en una subcarpeta para que esa busqueda no la encuentre
+        # antes: PyInstaller agrega _MEIPASS a las rutas de busqueda de DLL.
         try:
             dll = C.WinDLL(nombre)
         except OSError as e:
-            raise UC480Error(f"falta {nombre}.dll; instala '{d['sdk']}'") from e
+            copia = _dir_drivers() / d["paquete"] / f"{nombre}.dll"
+            if not copia.is_file():
+                raise UC480Error(f"falta {nombre}.dll; instala '{d['sdk']}'") from e
+            try:
+                dll = C.WinDLL(str(copia))
+            except OSError as e2:
+                raise UC480Error(f"no se pudo cargar {copia.name}: {e2}") from e2
         _dll_activa = (driver, dll)
         return dll
+
+
+# pnputil: 0 instalado; 259 paquete agregado, sin dispositivo que actualizar (lo
+# normal con la camara desconectada); 3010 instalado, falta reiniciar.
+PNPUTIL_OK = {0, 259}
+PNPUTIL_REINICIO = 3010
+
+
+def _dir_drivers() -> Path:
+    """La carpeta drivers: junto al script, o la embebida en el ejecutable."""
+    base = (Path(sys._MEIPASS) if getattr(sys, "frozen", False)
+            else Path(__file__).resolve().parent)
+    return base / "drivers"
+
+
+def script_instalacion(infs: dict[str, Path], salida: Path) -> str:
+    """Script de PowerShell que instala cada .inf y anota el codigo de cada uno."""
+    def comillas(ruta: Path) -> str:
+        return "'" + str(ruta).replace("'", "''") + "'"
+    lineas = ["$r = @()"]
+    for driver, inf in infs.items():
+        lineas.append(f"& pnputil.exe /add-driver {comillas(inf)} /install | Out-Null")
+        lineas.append(f'$r += "{driver}=$LASTEXITCODE"')
+    lineas.append(f"$r | Set-Content -Encoding ASCII -LiteralPath {comillas(salida)}")
+    return "\n".join(lineas)
+
+
+def orden_elevada(script: str) -> str:
+    """Orden de PowerShell que corre el script como administrador y espera.
+
+    Va codificado en base64 para no depender de como se escapan las comillas y
+    los espacios de las rutas al pasar por dos PowerShell seguidos.
+    """
+    codificado = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return ("Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait "
+            f"-ArgumentList '-NoProfile','-EncodedCommand','{codificado}'")
+
+
+def leer_resultados(texto: str) -> dict[str, int]:
+    """Los codigos que anoto script_instalacion, por driver."""
+    resultados = {}
+    for linea in texto.splitlines():
+        driver, _, codigo = linea.strip().partition("=")
+        if driver and codigo.lstrip("-").isdigit():
+            resultados[driver] = int(codigo)
+    return resultados
+
+
+def resumir_instalacion(resultados: dict[str, int]) -> str:
+    """Texto para el usuario. Basta con un driver: ambos sirven para las dos marcas."""
+    lineas = []
+    for driver, rc in resultados.items():
+        estado = ("instalado" if rc in PNPUTIL_OK or rc == PNPUTIL_REINICIO
+                  else f"fallo (codigo {rc})")
+        lineas.append(f"{DRIVERS[driver]['sdk']}: {estado}")
+    if not any(rc in PNPUTIL_OK or rc == PNPUTIL_REINICIO for rc in resultados.values()):
+        lineas.append("No se instalo ningun driver.")
+    elif PNPUTIL_REINICIO in resultados.values():
+        lineas.append("Reinicia Windows antes de usar la camara.")
+    else:
+        lineas.append("Conecta la camara por USB y pulsa Detectar camara.")
+    return "\n".join(lineas)
+
+
+def instalar_drivers() -> dict[str, int]:
+    """Instala los paquetes incluidos con pnputil, pidiendo permiso de administrador."""
+    if sys.platform != "win32":
+        raise UC480Error("los drivers solo se instalan en Windows")
+    infs = {k: _dir_drivers() / d["paquete"] / d["inf"] for k, d in DRIVERS.items()}
+    infs = {k: inf for k, inf in infs.items() if inf.is_file()}
+    if not infs:
+        raise UC480Error(f"no se encontraron los paquetes de driver en {_dir_drivers()}")
+    with tempfile.TemporaryDirectory() as carpeta:
+        salida = Path(carpeta) / "resultado.txt"
+        orden = orden_elevada(script_instalacion(infs, salida))
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command", orden],
+                           capture_output=True, text=True, timeout=600,
+                           stdin=subprocess.DEVNULL,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise UC480Error(f"no se pudo ejecutar el instalador: {e}") from e
+        if not salida.is_file():    # sin resultado: se rechazo el aviso de Windows
+            raise UC480Error("no se instalo: hace falta aceptar el permiso de administrador")
+        return leer_resultados(salida.read_text(encoding="ascii"))
+
+
+def accion_instalar_drivers(root) -> None:
+    """Boton de las dos GUIs. Espera en un hilo para no congelar la ventana."""
+    from tkinter import messagebox
+    if not messagebox.askyesno(
+            "Instalar drivers", "Se instalaran los drivers USB de Thorlabs e IDS. "
+            "Windows pedira permiso de administrador.\n\nContinuar?"):
+        return
+
+    def fin(ok: bool, texto: str) -> None:
+        (messagebox.showinfo if ok else messagebox.showerror)("Instalar drivers", texto)
+
+    def trabajo() -> None:
+        try:
+            res = resumir_instalacion(instalar_drivers())
+            root.after(0, lambda: fin("No se instalo" not in res, res))
+        except UC480Error as e:
+            msg = str(e)
+            root.after(0, lambda: fin(False, msg))
+
+    threading.Thread(target=trabajo, daemon=True).start()
 
 
 class UC480_CAMERA_INFO(C.Structure):
@@ -509,8 +629,9 @@ def interpretar_pnp(lineas: list[str]) -> str:
                 "camara, desconectala unos 10 s y probala en otro puerto o con otro "
                 "cable: es un problema del enlace, no del programa.")
     if "VID_1409" in texto:
-        return ("Windows ve una camara IDS/Thorlabs, pero el SDK no la lista. Revisa "
-                "que su driver este instalado y que otro programa no la tenga tomada.")
+        return ("Windows ve una camara IDS/Thorlabs, pero el SDK no la lista. Si no "
+                "tiene driver, pulsa Instalar drivers; si lo tiene, revisa que otro "
+                "programa no la tenga tomada.")
     return "Windows no ve ninguna camara en el USB: revisa el cable y el puerto."
 
 
@@ -2220,6 +2341,8 @@ class CamaraGUI:
         self.btn_detectar = ttk.Button(f, text=TEXTO_DETECTAR, style="Neon.TButton",
                                        command=self.detectar)
         self.btn_detectar.pack(fill="x", pady=(6, 0))
+        ttk.Button(f, text="Instalar drivers",
+                   command=lambda: accion_instalar_drivers(self.root)).pack(fill="x", pady=(4, 0))
         ttk.Button(f, text="Ajustes de camara...",
                    command=lambda: abrir_ajustes(self.root, self)).pack(fill="x", pady=(4, 0))
 
@@ -3109,10 +3232,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="mide la tasa de error USB y sale")
     p.add_argument("--detectar", action="store_true",
                    help="dice que camaras hay conectadas y de que tipo, y sale")
+    p.add_argument("--instalar-drivers", action="store_true",
+                   help="instala los drivers USB incluidos (pide administrador) y sale")
     return p
 
 
-MODE_FLAGS = {"self_test", "benchmark", "viewer", "gui", "menu", "detectar"}
+MODE_FLAGS = {"self_test", "benchmark", "viewer", "gui", "menu", "detectar",
+              "instalar_drivers"}
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
@@ -3158,6 +3284,16 @@ def main(argv: list[str] | None = None) -> int:
         self_path = (str(Path(sys._MEIPASS) / "camara.py")
                      if getattr(sys, "frozen", False) else __file__)
         return pytest.main(["-q", "--no-header", self_path])
+
+    if args.instalar_drivers:
+        try:
+            resultados = instalar_drivers()
+        except UC480Error as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(resumir_instalacion(resultados))
+        return 0 if any(rc in PNPUTIL_OK or rc == PNPUTIL_REINICIO
+                        for rc in resultados.values()) else 1
 
     cfg = config_from_args(args)
     if args.detectar:
@@ -3481,6 +3617,76 @@ def test_las_dos_dlls_se_cargan_de_a_una(monkeypatch):
     finally:
         C.WinDLL = falsa
     assert cargadas == ["libera", "uEye_api_64"]
+
+
+def test_sin_dll_en_el_sistema_usa_la_embebida(monkeypatch):
+    import pytest
+    if sys.platform != "win32":
+        pytest.skip("solo Windows")
+    cargadas = []
+
+    def falsa(nombre):
+        cargadas.append(nombre)
+        if nombre == "uc480_64":
+            raise OSError("no esta en el sistema")
+        return object()
+
+    monkeypatch.setitem(globals(), "_dll_activa", None)
+    monkeypatch.setitem(globals(), "_camaras_abiertas", 0)
+    monkeypatch.setattr(C, "WinDLL", falsa)
+    _cargar_dll("uc480")
+    # La del sistema se prueba antes: es la que coincide con el driver instalado.
+    assert cargadas[0] == "uc480_64"
+    assert Path(cargadas[1]) == _dir_drivers() / "DCx_USB_Driver_Package" / "uc480_64.dll"
+
+
+def test_sin_dll_ni_copia_embebida_dice_que_falta(monkeypatch, tmp_path):
+    import pytest
+    if sys.platform != "win32":
+        pytest.skip("solo Windows")
+
+    def falsa(nombre):
+        raise OSError("no esta")
+
+    monkeypatch.setitem(globals(), "_dll_activa", None)
+    monkeypatch.setitem(globals(), "_camaras_abiertas", 0)
+    monkeypatch.setitem(globals(), "_dir_drivers", lambda: tmp_path)
+    monkeypatch.setattr(C, "WinDLL", falsa)
+    with pytest.raises(UC480Error, match="falta uc480_64.dll"):
+        _cargar_dll("uc480")
+
+
+def test_los_paquetes_de_driver_estan_completos():
+    """Lo que hace falta sin nada instalado: la DLL, el .inf, su firma y los .sys."""
+    uc480 = _dir_drivers() / "DCx_USB_Driver_Package"
+    for nombre in ("uc480_64.dll", "uc480_64.inf", "uc480_64.cat",
+                   "drivers/uc480_64.sys", "drivers/uc480_boot_64.sys"):
+        assert (uc480 / nombre).is_file(), nombre
+    ueye = _dir_drivers() / "uEye_USB_Driver_Package"
+    for nombre in ("ueye_api_64.dll", "ueye_64.inf", "ueye_64.cat",
+                   "drivers/uEye_usb_64.sys", "drivers/ueye_boot_64.sys"):
+        assert (ueye / nombre).is_file(), nombre
+
+
+def test_script_de_instalacion_escapa_rutas_y_anota_cada_driver(tmp_path):
+    infs = {"uc480": Path("C:/Mi usuario/d'Arc/a.inf"), "ueye": Path("C:/b.inf")}
+    script = script_instalacion(infs, tmp_path / "r.txt")
+    assert "d''Arc" in script                   # la comilla no corta la cadena
+    assert script.count("/add-driver") == 2
+    assert '$r += "uc480=$LASTEXITCODE"' in script
+    orden = orden_elevada(script)
+    assert "-Verb RunAs" in orden
+    codificado = orden.split("'-EncodedCommand','")[1].rstrip("'")
+    assert base64.b64decode(codificado).decode("utf-16-le") == script
+
+
+def test_resultados_de_instalacion_se_interpretan():
+    assert leer_resultados("uc480=259\r\nueye=-5\r\nbasura\r\n") == {"uc480": 259, "ueye": -5}
+    # Basta con un driver: ambos sirven para las dos marcas.
+    assert "Conecta la camara" in resumir_instalacion({"uc480": 259, "ueye": 5})
+    assert "fallo (codigo 5)" in resumir_instalacion({"uc480": 259, "ueye": 5})
+    assert "Reinicia" in resumir_instalacion({"uc480": 3010})
+    assert "No se instalo" in resumir_instalacion({"uc480": 5, "ueye": 5})
 
 
 def test_opciones_de_mascara_salen_de_lo_que_declara_la_camara():

@@ -1,12 +1,13 @@
 @echo off
 setlocal
-rem Instala el driver USB de IDS uEye desde el SDK de IDS ya instalado en este PC.
-rem Los archivos de IDS no van en el repositorio (ver LEEME.md). Requiere administrador.
+rem Instala el driver USB de IDS uEye. Requiere administrador.
+rem Prefiere el SDK de IDS de este PC, si lo hay; si no, usa el paquete incluido.
 
 set "PF=%ProgramFiles%"
 if defined ProgramW6432 set "PF=%ProgramW6432%"
 set "INF=%PF%\IDS\uEye\USB driver package\ueye_64.inf"
-if not exist "%INF%" goto sin_sdk
+if not exist "%INF%" set "INF=%~dp0uEye_USB_Driver_Package\ueye_64.inf"
+if not exist "%INF%" goto sin_paquete
 
 net session >nul 2>&1
 if errorlevel 1 goto sin_admin
@@ -34,15 +35,10 @@ echo Listo, pero hay que reiniciar Windows antes de usar la camara.
 pause
 exit /b 0
 
-:sin_sdk
-echo No se encontro el SDK de IDS uEye en este PC. Se busco:
+:sin_paquete
+echo ERROR: no se encontro el paquete del driver:
 echo   %INF%
-echo.
-echo Descarga e instala IDS Software Suite desde el sitio de IDS:
-echo   https://en.ids-imaging.com/downloads.html
-echo y vuelve a ejecutar este archivo si la camara no aparece.
-echo.
-echo Alternativa sin descargas: Instalar_driver_ThorCam.bat tambien sirve para camaras uEye.
+echo Copia la carpeta drivers completa, no solo este archivo.
 pause
 exit /b 1
 

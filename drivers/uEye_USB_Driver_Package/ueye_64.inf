@@ -1,0 +1,303 @@
+;================================================================
+; uEye.inf
+;
+; Windows 2000/XP/2003/Vista/Win7 Installation file (.inf) for the
+; uEye Camera family
+;
+; (c) Copyright 2003 - 2012 IDS Imaging Development Software GmbH 
+;
+;================================================================
+
+[Version]
+Signature           = $Windows NT$
+Class               = USB
+ClassGuid           = {36FC9E60-C465-11CF-8056-444553540000} 
+Provider            = %IDS%
+DriverVer           = 08/03/2012, 4.2.11.0
+CatalogFile.ntamd64 = uEye_64.cat
+
+ 
+;==========================================
+; Source file information
+;==========================================
+
+[DestinationDirs]
+UEYE.CopyFiles.sys      = 12    ; %windir%\system32\drivers
+UEYE.CopyFiles.dll      = 11    ; %windir%\system32
+UEYE_BOOT.CopyFiles.sys = 12    ; %windir%\system32\drivers
+UEYE_BOOT.CopyFiles.dll = 11    ; %windir%\system32
+
+
+[SourceDisksNames]
+1 = %uEyeInstallationMedia%,,,\drivers
+2 = %uEyeInstallationMedia%,,,
+
+
+[SourceDisksFiles]
+ueye_usb_64.sys   = 1
+ueye_boot_64.sys  = 1
+ueye_api_64.dll   = 2
+ueye_tools_64.dll = 2
+
+;==========================================
+; driver information
+;==========================================
+
+[Manufacturer]
+%IDS% = IDSGMBH, ntamd64
+
+[IDSGMBH.ntamd64]
+%USB\VID_1409&PID_1000.DeviceDesc%=UEYE_BOOT.Dev, USB\VID_1409&PID_1000	; Start
+%USB\VID_1409&PID_1410.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1410	; VGA rolling shutter CMOS camera
+%USB\VID_1409&PID_1440.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1440	; SXGA rolling shutter CMOS camera
+%USB\VID_1409&PID_1450.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1450	; UXGA rolling shutter CMOS camera
+%USB\VID_1409&PID_1453.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1453	; UXGA rolling shutter CMOS camera, single board
+%USB\VID_1409&PID_1455.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1455	; UXGA rolling shutter CMOS camera, LE model
+%USB\VID_1409&PID_1550.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1550	; UXGA rolling shutter CMOS camera
+%USB\VID_1409&PID_1555.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1555	; UXGA rolling shutter CMOS camera, LE model
+%USB\VID_1409&PID_1460.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1460	; QXGA rolling shutter CMOS camera
+%USB\VID_1409&PID_1463.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1463	; QXGA rolling shutter CMOS camera, single board
+%USB\VID_1409&PID_1465.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1465	; QXGA rolling shutter CMOS camera, LE model
+%USB\VID_1409&PID_1480.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1480	; 5MP  rolling shutter CMOS camera
+%USB\VID_1409&PID_1483.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1483	; 5MP  rolling shutter CMOS camera, single board
+%USB\VID_1409&PID_1485.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1485	; 5MP  rolling shutter CMOS camera, LE model
+%USB\VID_1409&PID_1580.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1580	; 5MP  rolling shutter CMOS camera
+%USB\VID_1409&PID_1585.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1585	; 5MP  rolling shutter CMOS camera, LE model
+%USB\VID_1409&PID_1540.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1540	; SXGA rolling shutter CMOS camera
+%USB\VID_1409&PID_1543.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1543	; SXGA rolling shutter CMOS camera, single board
+%USB\VID_1409&PID_1544.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1544	; SXGA rolling shutter CMOS camera
+%USB\VID_1409&PID_1545.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1545	; SXGA rolling shutter CMOS camera, LE model
+%USB\VID_1409&PID_C007.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_C007	; SXGA rolling shutter CMOS camera, SMI model
+%USB\VID_1409&PID_1640.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1640	; SXGA rolling shutter CMOS camera
+%USB\VID_1409&PID_1645.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1645	; SXGA rolling shutter CMOS camera, LE model
+%USB\VID_1409&PID_C006.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_C006	; SXGA rolling shutter CMOS camera, AR model
+%USB\VID_1409&PID_1490.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1490	; 10MP rolling shutter CMOS camera
+%USB\VID_1409&PID_1493.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1493	; 10MP rolling shutter CMOS camera, single board
+%USB\VID_1409&PID_1495.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1495	; 10MP rolling shutter CMOS camera, LE model
+%USB\VID_1409&PID_C00B.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_C00B	; 10MP rolling shutter CMOS camera, AR model
+%USB\VID_1409&PID_1120.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1120	; PAL  rolling shutter HDR camera
+%USB\VID_1409&PID_1210.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1210	; VGA  global shutter CMOS camera
+%USB\VID_1409&PID_1220.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1220	; WVGA global shutter CMOS camera
+%USB\VID_1409&PID_1223.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1223	; WVGA global shutter CMOS camera
+%USB\VID_1409&PID_1225.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1225	; WVGA global shutter CMOS camera, LE model
+%USB\VID_1409&PID_C005.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_C005	; WVGA global shutter CMOS camera, TL model
+%USB\VID_1409&PID_1240.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1240	; SXGA global shutter CMOS camera
+%USB\VID_1409&PID_1245.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1245	; SXGA global shutter CMOS camera, LE model
+%USB\VID_1409&PID_1247.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1247	; SXGA global shutter CMOS camera, ML model
+%USB\VID_1409&PID_C00A.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_C00A	; SXGA global shutter CMOS camera, SMI model
+%USB\VID_1409&PID_1008.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_1008	; HDTV global shutter CMOS camera, XS model
+%USB\VID_1409&PID_2210.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_2210	; CCD VGA Series
+%USB\VID_1409&PID_2310.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_2310	; CCD VGA Series
+%USB\VID_1409&PID_2410.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_2410	; CCD VGA Series
+%USB\VID_1409&PID_2220.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_2220	; CCD PAL
+%USB\VID_1409&PID_2230.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_2230	; CCD XGA Series
+%USB\VID_1409&PID_2240.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_2240	; CCD SXGA Series
+%USB\VID_1409&PID_2340.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_2340	; CCD SXGA Series
+%USB\VID_1409&PID_2250.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_2250	; CCD UXGA Series
+%USB\VID_1409&PID_2140.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_2140	; CCD SXGA Series
+%USB\VID_1409&PID_2280.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_2280	; CCD 5MP Series
+%USB\VID_1409&PID_2130.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_2130
+%USB\VID_1409&PID_3240.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_3240	; SXGA global shutter CMOS USB3 camera
+%USB\VID_1409&PID_3220.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_3220	; VGA global shutter CMOS USB3 camera
+%USB\VID_1409&PID_3480.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_3480	; 5MP rolling shutter CMOS USB3 camera
+%USB\VID_1409&PID_3580.DeviceDesc%=UEYE.Dev, USB\VID_1409&PID_3580	; 5MP rolling shutter CMOS USB3 camera
+
+
+;==========================================
+; General installation section
+;==========================================
+
+[UEYE.Dev]
+AddReg    = UEYE.AddReg
+CopyFiles = UEYE.CopyFiles.sys, UEYE.CopyFiles.dll
+
+
+[UEYE.Dev.NT]
+AddReg    = UEYE.AddReg
+CopyFiles = UEYE.CopyFiles.sys, UEYE.CopyFiles.dll
+
+
+[UEYE.AddReg]
+HKR,,DevLoader,,*ntkern
+HKR,,NTMPDriver,,uEye_usb_64.sys
+
+
+[UEYE.CopyFiles.sys]
+ueye_boot_64.sys,,,4
+ueye_usb_64.sys,,,4
+
+
+[UEYE.CopyFiles.dll]
+ueye_api_64.dll,,,4
+ueye_tools_64.dll,,,4
+
+
+;==========================================
+; Service Installation
+;==========================================
+
+[UEYE.Dev.Services] 		
+AddService = ueye,  0x00000002, UEYE.AddService, UEYE.EventLog.Inst
+
+[UEYE.Dev.NT.Services]
+AddService = ueye,  0x00000002, UEYE.AddService, UEYE.EventLog.Inst
+
+
+[UEYE.AddService]
+DisplayName    = %UEYE.SvcDesc%
+ServiceType    = 1                     ; SERVICE_KERNEL_DRIVER
+StartType      = 3                     ; SERVICE_DEMAND_START
+ErrorControl   = 1                     ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\uEye_usb_64.sys  ; Pfadname der SYS-Datei
+LoadOrderGroup = Extended Base
+AddReg         = UEYE_SERVICE.AddReg
+
+[UEYE_SERVICE.AddReg]
+HKR,"Parameters","Devices",%REG_DWORD%,0
+HKR,"Parameters","EventLogLevel",%REG_DWORD%, 2
+
+[UEYE.EventLog.Inst]
+AddReg = UEYE.EventLog.AddReg
+
+[UEYE.EventLog.AddReg]
+HKR,,EventMessageFile,0x00020000,"%%SystemRoot%%\System32\IoLogMsg.dll;%%SystemRoot%%\System32\drivers\ueye_usb_64.sys"
+HKR,,TypesSupported,0x00010001,7
+
+
+
+;==========================================
+; Strings
+;==========================================
+
+[Strings]
+
+;------------ Non-Localizable Strings
+REG_SZ         = 0x00000000
+REG_MULTI_SZ   = 0x00010000
+REG_EXPAND_SZ  = 0x00020000
+REG_BINARY     = 0x00000001
+REG_DWORD      = 0x00010001
+SERVICEROOT    = "System\CurrentControlSet\Services"
+
+
+;----------- Localizable Strings
+IDS 				 = "IDS Imaging Development Systems GmbH"
+USB\VID_1409&PID_1000.DeviceDesc = "uEye boot"                      ; Start
+USB\VID_1409&PID_1410.DeviceDesc = "uEye UI-141x Series"			; VGA rolling shutter CMOS camera
+USB\VID_1409&PID_1440.DeviceDesc = "uEye UI-144x Series"			; SXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1450.DeviceDesc = "uEye UI-145x Series"			; UXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1453.DeviceDesc = "uEye UI-1453 Series"			; UXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1455.DeviceDesc = "uEye UI-145xLE Series"			; UXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1550.DeviceDesc = "uEye UI-155x Series"			; UXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1555.DeviceDesc = "uEye UI-155xLE Series"			; UXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1460.DeviceDesc = "uEye UI-146x Series"			; QXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1463.DeviceDesc = "uEye UI-1463 Series"			; QXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1465.DeviceDesc = "uEye UI-146xLE Series"			; QXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1480.DeviceDesc = "uEye UI-148x Series"			; 5MP  rolling shutter CMOS camera
+USB\VID_1409&PID_1483.DeviceDesc = "uEye UI-1483 Series"			; 5MP  rolling shutter CMOS camera
+USB\VID_1409&PID_1485.DeviceDesc = "uEye UI-148xLE Series"			; 5MP  rolling shutter CMOS camera
+USB\VID_1409&PID_1580.DeviceDesc = "uEye UI-158x Series"			; 5MP  rolling shutter CMOS camera
+USB\VID_1409&PID_1585.DeviceDesc = "uEye UI-158xLE Series"			; 5MP  rolling shutter CMOS camera
+USB\VID_1409&PID_1540.DeviceDesc = "uEye UI-154x Series"			; SXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1543.DeviceDesc = "uEye UI-1543 Series"			; SXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1544.DeviceDesc = "uEye UI-1543-OD Series"			; SXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1545.DeviceDesc = "uEye UI-154xLE Series"			; SXGA rolling shutter CMOS camera
+USB\VID_1409&PID_C007.DeviceDesc = "uEye UI-1543-SMI Series"        ; SXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1640.DeviceDesc = "uEye UI-164x Series"			; SXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1645.DeviceDesc = "uEye UI-164xLE Series"			; SXGA rolling shutter CMOS camera
+USB\VID_1409&PID_C006.DeviceDesc = "uEye UI-1643-AR Series"         ; SXGA rolling shutter CMOS camera
+USB\VID_1409&PID_1490.DeviceDesc = "uEye UI-149x Series"			; 10MP rolling shutter CMOS camera
+USB\VID_1409&PID_1493.DeviceDesc = "uEye UI-1493 Series"			; 10MP rolling shutter CMOS camera
+USB\VID_1409&PID_1495.DeviceDesc = "uEye UI-149xLE Series"			; 10MP rolling shutter CMOS camera
+USB\VID_1409&PID_C00B.DeviceDesc = "uEye UI-1493-AR Series"         ; 10MP rolling shutter CMOS camera
+USB\VID_1409&PID_1120.DeviceDesc = "uEye UI-112x Series"			; PAL  rolling shutter HDR camera
+USB\VID_1409&PID_1210.DeviceDesc = "uEye UI-121x Series"			; VGA  global shutter CMOS camera
+USB\VID_1409&PID_1220.DeviceDesc = "uEye UI-122x Series"			; WVGA global shutter CMOS camera
+USB\VID_1409&PID_1223.DeviceDesc = "uEye UI-1223 Series"			; WVGA global shutter CMOS camera
+USB\VID_1409&PID_C005.DeviceDesc = "uEye UI-1223TL Series"          ; WVGA global shutter CMOS camera
+USB\VID_1409&PID_1225.DeviceDesc = "uEye UI-122xLE Series"			; WVGA global shutter CMOS camera
+USB\VID_1409&PID_1240.DeviceDesc = "uEye UI-124x Series"			; SXGA global shutter CMOS camera
+USB\VID_1409&PID_1245.DeviceDesc = "uEye UI-124xLE Series"			; SXGA global shutter CMOS camera
+USB\VID_1409&PID_1247.DeviceDesc = "uEye UI-124xML Series"			; SXGA global shutter CMOS camera
+USB\VID_1409&PID_C00A.DeviceDesc = "uEye UI-1243-SMI Series"		; SXGA global shutter CMOS camera
+USB\VID_1409&PID_1008.DeviceDesc = "uEye UI-1008 Series"			; HDTV global shutter CMOS camera
+USB\VID_1409&PID_2210.DeviceDesc = "uEye UI-221x Series"			; uEye VGA  CCD Series
+USB\VID_1409&PID_2310.DeviceDesc = "uEye UI-231x Series"			; uEye XGA / SXGA CCD Series
+USB\VID_1409&PID_2410.DeviceDesc = "uEye UI-241x Series"			; uEye XGA / SXGA CCD Series
+USB\VID_1409&PID_2220.DeviceDesc = "uEye UI-222x Series"			; uEye CCIR CCD Series
+USB\VID_1409&PID_2230.DeviceDesc = "uEye UI-223x Series"			; uEye XGA  CCD Series
+USB\VID_1409&PID_2240.DeviceDesc = "uEye UI-224x Series"			; uEye SXGA CCD Series
+USB\VID_1409&PID_2340.DeviceDesc = "uEye UI-234x Series"			; uEye SXGA CCD Series
+USB\VID_1409&PID_2250.DeviceDesc = "uEye UI-225x Series"			; uEye UXGA CCD Series
+USB\VID_1409&PID_2140.DeviceDesc = "uEye UI-214x Series"			; uEye SXGA CCD Series
+USB\VID_1409&PID_2280.DeviceDesc = "uEye UI-228x Series"			; uEye 5MP  CCD Series
+USB\VID_1409&PID_2130.DeviceDesc = "uEye UI-213x Series"
+USB\VID_1409&PID_3240.DeviceDesc = "uEye UI-324x Series"            ; SXGA global shutter CMOS USB3 camera
+USB\VID_1409&PID_3220.DeviceDesc = "uEye UI-322x Series"            ; VGA global shutter CMOS USB3 camera
+USB\VID_1409&PID_3480.DeviceDesc = "uEye UI-348x Series"            ; 5MP rolling shutter CMOS USB3 camera
+USB\VID_1409&PID_3580.DeviceDesc = "uEye UI-358x Series"            ; 5MP rolling shutter CMOS USB3 camera
+
+
+UEYE.SvcDesc           = "IDS uEye Kernel Driver"
+Version                = "4.2.11.0"
+UEYE_BOOT.SvcDesc      = "IDS uEye boot driver"
+uEyeInstallationMedia  = "Path to uEye inf file"	
+
+
+;==========================================
+; BOOT sections
+;==========================================
+[UEYE_BOOT.Dev]
+AddReg = UEYE_BOOT.AddReg
+CopyFiles = UEYE_BOOT.CopyFiles.sys, UEYE_BOOT.CopyFiles.dll
+
+
+[UEYE_BOOT.Dev.NT]
+AddReg = UEYE_BOOT.AddReg
+CopyFiles = UEYE_BOOT.CopyFiles.sys, UEYE_BOOT.CopyFiles.dll
+
+
+[UEYE_BOOT.AddReg]
+HKR,,DevLoader,,*ntkern
+HKR,,NTMPDriver,,uEye_boot_64.sys
+
+
+[UEYE_BOOT.CopyFiles.sys]
+ueye_boot_64.sys,,,4
+ueye_usb_64.sys,,,4
+
+
+[UEYE_BOOT.CopyFiles.dll]
+ueye_api_64.dll,,,4
+ueye_tools_64.dll,,,4
+
+
+[UEYE_BOOT.Dev.Services] 		
+Addservice = ueye_boot,  0x00000002, UEYE_BOOT.AddService, UEYE_BOOT.EventLog.Inst
+
+
+[UEYE_BOOT.Dev.NT.Services]
+Addservice = ueye_boot,  0x00000002, UEYE_BOOT.AddService, UEYE_BOOT.EventLog.Inst
+
+
+[UEYE_BOOT.AddService]
+DisplayName    = %UEYE_BOOT.SvcDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\uEye_boot_64.sys
+LoadOrderGroup = Extended Base
+AddReg         = UEYE_BOOT_SERVICE.AddReg
+
+
+[UEYE_BOOT_SERVICE.AddReg]
+HKR,"Parameters","Devices",%REG_DWORD%,0
+HKR,"Parameters","EventLogLevel",%REG_DWORD%, 2
+
+[UEYE_BOOT.EventLog.Inst]
+AddReg = UEYE_BOOT.EventLog.AddReg
+
+
+[UEYE_BOOT.EventLog.AddReg]
+HKR,,EventMessageFile,0x00020000,"%%SystemRoot%%\System32\IoLogMsg.dll;%%SystemRoot%%\System32\drivers\ueye_boot_64.sys"
+HKR,,TypesSupported,0x00010001,7
