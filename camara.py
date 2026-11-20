@@ -174,7 +174,7 @@ class Config:
     binning: int = 1              # 1 = sin binning; 2, 3 o 4 = vertical
     driver: str = "auto"          # auto, uc480 (Thorlabs) o ueye (IDS)
     camera_id: int = 0            # 0 toma la primera camara libre
-    pixel_clock: int = 0          # MHz; 0 deja el valor por defecto del driver
+    pixel_clock: int = 43         # MHz; se recorta al rango de la camara; 0 deja el del driver
     fps: float = 0.0              # 0 pide el maximo que permita el pixel clock
     retries: int = 8              # reintentos ante IS_TRANSFER_ERROR
     roi_radius: int = 3           # se promedia un parche de (2r+1)^2 pixeles
@@ -1412,6 +1412,15 @@ def guardar_ultimos(cam, realce: bool, ruta: Path | None = None) -> None:
         pass
 
 
+def reloj_en_rango(mhz: int, rango) -> int:
+    """El pixel clock pedido, dentro del rango (min, max, paso) que declara la camara."""
+    if not rango:
+        return mhz
+    lo, hi, paso = rango
+    mhz = min(max(mhz, lo), hi)
+    return int(lo + round((mhz - lo) / paso) * paso) if paso else mhz
+
+
 def _opciones_explicitas(cfg: Config) -> bool:
     """Si se pidieron valores al arrancar, mandan sobre lo recordado."""
     d = Config()
@@ -1551,7 +1560,9 @@ class UC480Camera(AjustesMixin):
 
         # El orden importa: cada paso reajusta el rango valido del siguiente.
         if cfg.pixel_clock:
-            self.set_pixel_clock(cfg.pixel_clock)
+            # 43 MHz da 25 cuadros/s en la C1280R12C contra 14 con los 24 de fabrica.
+            # Otra camara puede tener otro tope: se recorta a lo que declara.
+            self.set_pixel_clock(reloj_en_rango(cfg.pixel_clock, self.cap.get("reloj")))
         self.pixel_clock = self.get_pixel_clock()
         self.fps = self.set_fps(cfg.fps)
         self.exposure_ms = self.pedir_exposicion(cfg.exposure_ms)
@@ -3970,7 +3981,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--camera-id", type=int, default=d.camera_id,
                    help="id de la camara; 0 toma la primera libre")
     p.add_argument("-c", "--pixel-clock", type=int, default=d.pixel_clock,
-                   help="MHz, segun la camara; 0 usa el valor por defecto del driver")
+                   help="MHz; por defecto 43, recortado al rango de la camara; 0 usa el del driver")
     p.add_argument("-f", "--fps", type=float, default=d.fps, help="0 pide el maximo")
     p.add_argument("--retries", type=int, default=d.retries,
                    help="reintentos ante error de transferencia USB")
@@ -4322,6 +4333,15 @@ def test_la_espera_de_cuadro_cubre_exposiciones_largas():
     assert espera_de_cuadro_ms(10.0, 25.0) == 2 * 40 + 500
     assert espera_de_cuadro_ms(893.0, 1.1) == int(2 * (1000 / 1.1) + 500)
     assert espera_de_cuadro_ms(5.0, 0.0) == 2500
+
+
+def test_el_reloj_por_defecto_se_recorta_al_rango_de_la_camara():
+    assert Config().pixel_clock == 43
+    assert reloj_en_rango(43, (5, 43, 1)) == 43         # la C1280R12C
+    assert reloj_en_rango(43, (5, 30, 1)) == 30         # una camara con tope menor
+    assert reloj_en_rango(2, (5, 43, 1)) == 5
+    assert reloj_en_rango(43, (6, 40, 4)) == 38         # respeta el paso
+    assert reloj_en_rango(43, None) == 43
 
 
 def test_la_espera_descuenta_lo_que_tardo_el_dibujo():

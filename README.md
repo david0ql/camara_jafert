@@ -384,8 +384,10 @@ que muestra la casilla. Es solo para mirar: las lecturas, los archivos guardados
 siguen usando los valores reales.
 
 **El visor en vivo transmite en continuo**, como ThorCam, y muestra siempre el cuadro más
-reciente. Con la C1280R12C da unos 14 cuadros/s con el pixel clock de fábrica (24 MHz) y 25 con
-43 MHz (*Ajustes de cámara*), frente a 7 de la versión anterior. Nunca puede superar 1 ÷
+reciente. Con la C1280R12C da 25 cuadros/s con el pixel clock por defecto, 43 MHz, y 14 con los
+24 MHz de fábrica, frente a 7 de la versión anterior. Si una cámara admite menos de
+43 MHz, se usa su máximo. Una sesión guardada trae su propio pixel clock y manda sobre
+el valor por defecto. Nunca puede superar 1 ÷
 exposición: con 900 ms va a ~1 cuadro/s, así que para alinear conviene una exposición corta con
 **Realzar en pantalla**. Tras cada cambio de ajuste se descarta un cuadro, porque el sensor aplica
 el cambio con un cuadro de atraso. Con trigger externo o por software se captura foto a foto.
@@ -488,8 +490,9 @@ Abre en un menú con los dos métodos:
 
 - **Método estático** — polarizador lineal y lámina cuarto de onda fijos.
   Implementado.
-- **Método dinámico** — cuarto de onda rotante y polarizador lineal fijo.
-  Por ahora avisa que está en construcción y vuelve al menú.
+- **Método dinámico** — cuarto de onda rotante y polarizador lineal fijo, con
+  tantas tomas como se elijan. Implementado; falta validarlo con la cámara y una
+  lámina real.
 
 ## El método estático
 
@@ -521,6 +524,53 @@ La inversión es directa y exacta, sin ajuste ni mínimos cuadrados:
 ```
 S₀ = I₁ + I₃      S₁ = I₁ − I₃      S₂ = 2I₂ − S₀      S₃ = 2I₄ − S₀
 ```
+
+## El método dinámico
+
+También es de **Goldstein, cap. 6** (cuarto de onda rotante). El polarizador queda
+**fijo a 0°** y la lámina cuarto de onda gira; el orden del haz es el mismo,
+`luz → cuarto de onda → polarizador → cámara`. Con el eje rápido a θ:
+
+```
+I(θ) = ½ [A − B·sin2θ + C·cos4θ + D·sin4θ]
+S₀ = A − C      S₁ = 2C      S₂ = 2D      S₃ = B
+```
+
+Al elegirlo se piden cuatro datos:
+
+| Dato | Qué es |
+|---|---|
+| Número de tomas | cuántas fotos se toman, una por ángulo de la lámina |
+| Ángulo inicial | dónde está la lámina en la primera toma |
+| Recorrido | cuánto gira la lámina en toda la serie: 360° o 180° |
+| Retardo | 90° para un cuarto de onda ideal; el de la lámina a esa longitud de onda si se conoce |
+
+Con eso el programa calcula el ángulo de cada toma, `inicio + k·recorrido/N`, y
+vuelve a contar desde 0 al pasar de 360°: con inicio 350° y 16 tomas pide 350°,
+12.5°, 35°, … Después guía toma por toma igual que el método estático.
+
+**No todo número de tomas sirve.** Sobre 360° fallan 4, 6 y 8 (sirven 5, 7 y de 9 en
+adelante); sobre 180°, de 5 en adelante. Con 8 tomas de 45°, sin 4θ vale 0 en todas
+y S₂ no se puede medir. La pantalla lo comprueba al escribir y sugiere el valor
+válido más cercano.
+
+Los Stokes salen por **mínimos cuadrados** sobre todas las tomas: con pasos iguales
+da exactamente las sumas de Fourier del libro, y además admite una lámina que no
+retarda 90°. La imagen aparece en cuanto las tomas hechas alcanzan para separar los
+cuatro parámetros, y mejora con cada toma.
+
+El panel muestra el **residuo del ajuste**: lo que las fotos se apartan del modelo,
+como fracción de S₀. Pasado el 5 % se marca en rojo, porque la luz cambió, algo se
+movió o un ángulo quedó muy mal puesto. Dos límites a tener en cuenta:
+
+- Un ángulo corrido unos grados en una sola toma da poco residuo (10° en una de 16
+  tomas, 0.4 %): el aviso es para errores gruesos.
+- **Un retardo mal supuesto no deja residuo**: la modulación tiene los mismos
+  términos y el ajuste cierra, pero los Stokes salen corridos (una lámina de 80°
+  tratada como de 90° da S₂ −0.33 en vez de −0.40). Hay que conocer el retardo.
+
+Al exportar, el `.npz` guarda además `angulo_qwp_deg` (el ángulo de cada toma) y
+`retardo_deg`.
 
 ## Construcción en vivo
 
@@ -594,3 +644,12 @@ horizontal/vertical/±45, circular derecha e izquierda, luz sin polarizar y una
 mezcla parcial; que I(θ) se reduzca a la ley de Malus sin retardador; que el
 azimut y la elipticidad den los valores de libro; y que los píxeles sin luz no
 produzcan `NaN` que contaminen la imagen.
+
+Para el método dinámico, las tomas se simulan con el **producto de matrices de
+Mueller** (polarizador × retardador), no con la fórmula que se invierte. Los tests
+comprueban que la convención de signos es la misma que la del estático; que la fila
+de Mueller es la modulación de Goldstein; que con pasos iguales el ajuste da las
+sumas de Fourier del libro; que todos los estados de referencia se recuperan con
+distintos números de tomas, recorridos y ángulos iniciales; los números de tomas que
+no sirven; la corrección de un retardo distinto de 90°; y que el residuo crece con un
+ángulo mal puesto.

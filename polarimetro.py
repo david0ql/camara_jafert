@@ -40,6 +40,22 @@ inversion es directa y exacta, sin ajuste ni minimos cuadrados:
 
     S0 = I1 + I3        S1 = I1 - I3
     S2 = 2 I2 - S0      S3 = 2 I4 - S0
+
+METODO DINAMICO
+---------------
+El polarizador queda fijo a 0 grados y el cuarto de onda gira: en la toma k su eje
+rapido esta a theta_k. Del producto de Mueller polarizador(0) x retardador(theta, 90)
+sale la modulacion de Goldstein (cap. 6, cuarto de onda rotante):
+
+    I(theta) = 1/2 [A - B sin(2 theta) + C cos(4 theta) + D sin(4 theta)]
+    S0 = A - C      S1 = 2 C      S2 = 2 D      S3 = B
+
+El usuario elige cuantas tomas N, el angulo inicial y el recorrido (360 o 180
+grados); los angulos son inicio + k * recorrido / N, contados de nuevo desde 0 al
+pasar de 360. Los Stokes salen por minimos cuadrados sobre las N tomas, que con
+pasos iguales coincide con las sumas de Fourier del libro. No todo N sirve: sobre
+360 grados fallan 4, 6 y 8 tomas, porque el termino en 4 theta se confunde con los
+otros; la interfaz lo comprueba y sugiere el valor valido mas cercano.
 """
 from __future__ import annotations
 
@@ -112,6 +128,120 @@ def stokes_desde_intensidades(i1, i2, i3, i4) -> np.ndarray:
     i1, i2, i3, i4 = (np.asarray(v, dtype=np.float64) for v in (i1, i2, i3, i4))
     s0 = i1 + i3
     return np.stack([s0, i1 - i3, 2.0 * i2 - s0, 2.0 * i4 - s0])
+
+
+# --- metodo dinamico: cuarto de onda rotante y polarizador lineal fijo ---------
+# Goldstein, Polarized Light, cap. 6. La lamina gira y el polarizador queda fijo
+# a 0 grados, siempre en el orden luz -> lamina -> polarizador -> camara. Con el
+# eje rapido a theta y retardo de 90 grados:
+#     I(theta) = 1/2 [A - B sin 2theta + C cos 4theta + D sin 4theta]
+#     S0 = A - C,  S1 = 2C,  S2 = 2D,  S3 = B
+# En vez de las sumas de Fourier se resuelve por minimos cuadrados con la fila de
+# Mueller de cada toma: con pasos iguales da lo mismo que las sumas, y ademas
+# admite una lamina que no retarda exactamente 90 grados y series incompletas.
+
+RECORRIDOS = (360.0, 180.0)     # grados que gira la lamina en toda la serie
+RETARDO_QWP = 90.0
+COND_MAX = 1e6                  # por encima, las tomas no separan los cuatro Stokes
+
+
+def mueller_polarizador(theta_deg: float) -> np.ndarray:
+    """Polarizador lineal ideal con el eje de transmision a theta (Goldstein 4-?)."""
+    c, s = np.cos(np.deg2rad(2 * theta_deg)), np.sin(np.deg2rad(2 * theta_deg))
+    return 0.5 * np.array([[1, c, s, 0],
+                           [c, c * c, c * s, 0],
+                           [s, c * s, s * s, 0],
+                           [0, 0, 0, 0]], dtype=np.float64)
+
+
+def mueller_retardador(theta_deg: float, retardo_deg: float) -> np.ndarray:
+    """Retardador lineal con el eje rapido a theta y retardo delta."""
+    c, s = np.cos(np.deg2rad(2 * theta_deg)), np.sin(np.deg2rad(2 * theta_deg))
+    cd, sd = np.cos(np.deg2rad(retardo_deg)), np.sin(np.deg2rad(retardo_deg))
+    return np.array([[1, 0, 0, 0],
+                     [0, c * c + cd * s * s, (1 - cd) * c * s, -sd * s],
+                     [0, (1 - cd) * c * s, s * s + cd * c * c, sd * c],
+                     [0, sd * s, -sd * c, cd]], dtype=np.float64)
+
+
+def fila_dinamica(theta_deg: float, retardo_deg: float = RETARDO_QWP) -> np.ndarray:
+    """Lo que ve la camara en una toma: I = fila . S, con la lamina antes del polarizador."""
+    return (mueller_polarizador(0.0) @ mueller_retardador(theta_deg, retardo_deg))[0]
+
+
+def angulos_dinamicos(n_tomas: int, inicio_deg: float = 0.0,
+                      recorrido_deg: float = 360.0) -> np.ndarray:
+    """El angulo de la lamina en cada toma: pasos iguales, de vuelta a 0 al pasar 360."""
+    if n_tomas < 1:
+        raise ValueError("hace falta al menos una toma")
+    paso = recorrido_deg / n_tomas
+    return (inicio_deg + paso * np.arange(n_tomas)) % 360.0
+
+
+def matriz_dinamica(angulos_deg, retardo_deg: float = RETARDO_QWP) -> np.ndarray:
+    """Una fila por toma: de los cuatro Stokes a la intensidad medida."""
+    return np.array([fila_dinamica(t, retardo_deg) for t in np.atleast_1d(angulos_deg)])
+
+
+def tomas_validas_cercanas(n: int, recorrido_deg: float, inicio_deg: float = 0.0,
+                           retardo_deg: float = RETARDO_QWP) -> int:
+    """El numero de tomas que sirve mas cercano a n, para sugerirlo.
+
+    No hay un minimo a partir del cual todo sirve: sobre 360 grados fallan 4, 6 y 8
+    pero 5 y 7 sirven, porque el termino en 4 theta se pliega sobre los otros.
+    """
+    for d in range(0, 361):
+        for m in (n + d, n - d):
+            if m >= 4 and not problema_de_tomas(
+                    angulos_dinamicos(m, inicio_deg, recorrido_deg), retardo_deg):
+                return m
+    raise ValueError("ningun numero de tomas sirve con ese retardo")
+
+
+def problema_de_tomas(angulos_deg, retardo_deg: float = RETARDO_QWP) -> str:
+    """Vacio si las tomas alcanzan para separar S0..S3; si no, el motivo.
+
+    Con pasos iguales sobre 360 grados el termino en 4 theta da cuatro vueltas: con
+    8 tomas de 45 grados sin 4theta es 0 en todas y S2 no se puede medir.
+    """
+    w = matriz_dinamica(angulos_deg, retardo_deg)
+    if len(w) < 4:
+        return f"con {len(w)} tomas no alcanza: hacen falta al menos 4"
+    sv = np.linalg.svd(w, compute_uv=False)
+    if sv[-1] <= sv[0] / COND_MAX:
+        return ("con esos angulos hay parametros de Stokes que no se distinguen: "
+                "las tomas caen en simetrias de la lamina")
+    return ""
+
+
+def stokes_dinamico(intensidades, angulos_deg,
+                    retardo_deg: float = RETARDO_QWP) -> tuple[np.ndarray, np.ndarray]:
+    """(S0..S3, residuo relativo) a partir de las tomas, pixel a pixel.
+
+    intensidades es una secuencia de escalares o imagenes, una por angulo. El
+    residuo es la raiz del error cuadratico medio del ajuste dividida por S0: si
+    las tomas siguen el modelo es casi 0, y crece si un angulo quedo mal puesto,
+    la luz vario o algo se movio entre tomas.
+    """
+    problema = problema_de_tomas(angulos_deg, retardo_deg)
+    if problema:
+        raise ValueError(problema)
+    w = matriz_dinamica(angulos_deg, retardo_deg)
+    datos = np.stack([np.asarray(i, dtype=np.float64) for i in intensidades])
+    forma = datos.shape[1:]
+    planos = datos.reshape(len(w), -1)
+    stokes = np.linalg.pinv(w) @ planos
+    resto = planos - w @ stokes
+    rms = np.sqrt(np.mean(resto ** 2, axis=0))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        residuo = np.nan_to_num(rms / np.where(np.abs(stokes[0]) < 1e-12, np.nan, stokes[0]))
+    return stokes.reshape((4, *forma)), residuo.reshape(forma)
+
+
+def pasos_dinamicos(angulos_deg) -> tuple[Paso, ...]:
+    """La serie como pasos de la guia: la lamina a cada angulo, el polarizador fijo."""
+    return tuple(Paso(k + 1, f"eje rapido a {t:.1f} deg", 0.0, f"I{k + 1} = I(theta = {t:.1f} deg)")
+                 for k, t in enumerate(angulos_deg))
 
 
 def parametros(stokes) -> dict[str, np.ndarray]:
@@ -200,6 +330,7 @@ UMBRAL_SENAL = 0.05      # fraccion de S0 maximo por debajo de la cual no hay da
 UMBRAL_DOP = 0.15        # debajo de esto se lee como no polarizada
 UMBRAL_LINEAL = 10.0     # |chi| menor: se lee como lineal
 UMBRAL_CIRCULAR = 35.0   # |chi| mayor: se lee como circular
+UMBRAL_RESIDUO = 0.05    # residuo del ajuste dinamico (fraccion de S0) que se marca
 
 
 def clasificar(p: dict[str, np.ndarray]) -> np.ndarray:
@@ -240,7 +371,7 @@ def imagen_estados(p: dict[str, np.ndarray]) -> np.ndarray:
 
 
 def exportar(destino: Path, medidas: dict[int, np.ndarray], p: dict[str, np.ndarray],
-             formato_fotos: str = ".npy") -> list[Path]:
+             formato_fotos: str = ".npy", extra: dict | None = None) -> list[Path]:
     """Guarda las fotografias y la imagen de polarizacion.
 
     Las fotos van en el formato que pida el usuario. Los mapas de Stokes van
@@ -255,7 +386,9 @@ def exportar(destino: Path, medidas: dict[int, np.ndarray], p: dict[str, np.ndar
         escritos.append(save_frame_as(img, destino / f"medida{n}_{sello}{formato_fotos}"))
 
     npz = destino / f"polarizacion_{sello}_stokes.npz"
-    np.savez_compressed(npz, **{k: v.astype(np.float64) for k, v in p.items()})
+    # extra lleva como se midio: en el dinamico, el angulo de la lamina en cada toma.
+    datos = {k: np.asarray(v, dtype=np.float64) for k, v in {**p, **(extra or {})}.items()}
+    np.savez_compressed(npz, **datos)
     escritos.append(npz)
     escritos.append(save_frame_as(imagen_falso_color(p).astype(np.float64),
                                   destino / f"polarizacion_{sello}_falsocolor.png"))
@@ -292,6 +425,12 @@ class PolarimetroGUI:
         self.win_ajustes = None
         self.medidas: dict[int, np.ndarray] = {}
         self.paso_actual = 0
+        # Metodo en curso: el estatico tiene sus cuatro pasos fijos; el dinamico,
+        # uno por angulo de la lamina.
+        self.metodo = "estatico"
+        self.pasos: tuple[Paso, ...] = PASOS_ESTATICO
+        self.angulos: np.ndarray | None = None
+        self.retardo = RETARDO_QWP
         self.params: dict[str, np.ndarray] | None = None
         self.photo = self.photo_pol = None
         self._img_id = self._pol_id = None
@@ -346,28 +485,114 @@ class PolarimetroGUI:
                   foreground=CYBER["tenue"], font=("Consolas", 9)).pack(pady=(4, 20))
 
         ttk.Button(caja, text="Metodo estatico\npolarizador lineal y lamina cuarto de onda",
-                   style="Neon.TButton", command=self._pantalla_estatico).pack(
+                   style="Neon.TButton", command=self._metodo_estatico).pack(
             fill="x", ipady=8)
         ttk.Label(caja, text="cuatro medidas, Goldstein cap. 6", foreground=CYBER["tenue"],
                   font=("Consolas", 8)).pack(pady=(2, 14))
 
         ttk.Button(caja, text="Metodo dinamico\ncuarto de onda rotante y polarizador lineal",
-                   command=self._metodo_dinamico).pack(fill="x", ipady=8)
+                   command=self._pantalla_config_dinamico).pack(fill="x", ipady=8)
         ttk.Label(caja, text="analisis de Fourier de la señal modulada",
                   foreground=CYBER["tenue"], font=("Consolas", 8)).pack(pady=(2, 0))
 
-    def _metodo_dinamico(self) -> None:
-        from tkinter import messagebox
-        messagebox.showinfo(
-            "En construccion",
-            "El metodo dinamico (cuarto de onda rotante y polarizador lineal fijo)\n"
-            "todavia esta en construccion.\n\n"
-            "Por ahora usa el metodo estatico.")
-        self._pantalla_metodos()
+    def _metodo_estatico(self) -> None:
+        self.metodo, self.pasos, self.angulos = "estatico", PASOS_ESTATICO, None
+        self._pantalla_medida()
 
-    # --- pantalla 2: metodo estatico ---
+    # --- pantalla 2b: configuracion del metodo dinamico ---
 
-    def _pantalla_estatico(self) -> None:
+    def _pantalla_config_dinamico(self) -> None:
+        """Cuantas tomas, desde que angulo y cuanto gira la lamina."""
+        tk, ttk = self.tk, self.ttk
+        self.detener()
+        self._limpiar()
+        caja = ttk.Frame(self.contenedor, padding=30)
+        caja.place(relx=0.5, rely=0.5, anchor="center")
+        ttk.Label(caja, text="METODO DINAMICO", font=("Consolas", 16, "bold"),
+                  foreground=CYBER["neon"]).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(caja, text="cuarto de onda rotante y polarizador lineal fijo a 0 grados\n"
+                             "orden del haz: luz -> cuarto de onda -> polarizador -> camara",
+                  foreground=CYBER["tenue"], font=("Consolas", 9), justify="left"
+                  ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 16))
+
+        self.var_tomas = tk.StringVar(value="16")
+        self.var_inicio = tk.StringVar(value="0")
+        self.var_recorrido = tk.StringVar(value="360")
+        self.var_retardo = tk.StringVar(value=f"{RETARDO_QWP:g}")
+        filas = (("Numero de tomas", ttk.Spinbox(caja, from_=4, to=360, width=8,
+                                                 textvariable=self.var_tomas)),
+                 ("Angulo inicial de la lamina (grados)",
+                  ttk.Entry(caja, width=10, textvariable=self.var_inicio)),
+                 ("Recorrido total (grados)",
+                  ttk.Combobox(caja, width=8, state="readonly", textvariable=self.var_recorrido,
+                               values=[f"{r:g}" for r in RECORRIDOS])),
+                 ("Retardo de la lamina (grados)",
+                  ttk.Entry(caja, width=10, textvariable=self.var_retardo)))
+        for i, (texto, w) in enumerate(filas, start=2):
+            ttk.Label(caja, text=texto).grid(row=i, column=0, sticky="w", pady=3)
+            w.grid(row=i, column=1, sticky="w", padx=(12, 0), pady=3)
+
+        self.lbl_config = ttk.Label(caja, text="", font=("Consolas", 9), justify="left",
+                                    wraplength=520)
+        self.lbl_config.grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 0))
+        fila = ttk.Frame(caja)
+        fila.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        ttk.Button(fila, text="< volver", command=self._pantalla_metodos).pack(side="left")
+        self.btn_comenzar = ttk.Button(fila, text="Comenzar la serie", style="Neon.TButton",
+                                       command=self._comenzar_dinamico)
+        self.btn_comenzar.pack(side="right")
+        for v in (self.var_tomas, self.var_inicio, self.var_recorrido, self.var_retardo):
+            v.trace_add("write", lambda *_a: self._revisar_config())
+        self._revisar_config()
+
+    def _leer_config(self) -> tuple[np.ndarray, float, str]:
+        """(angulos, retardo, problema). El problema es vacio si la serie sirve."""
+        try:
+            n = int(self.var_tomas.get())
+            inicio = float(self.var_inicio.get().replace(",", "."))
+            recorrido = float(self.var_recorrido.get())
+            retardo = float(self.var_retardo.get().replace(",", "."))
+        except ValueError:
+            return np.array([]), RETARDO_QWP, "escribi numeros en todos los campos"
+        if not 4 <= n <= 360:
+            return np.array([]), retardo, "el numero de tomas va de 4 a 360"
+        if not 0 < retardo < 180:
+            return np.array([]), retardo, "el retardo tiene que estar entre 0 y 180 grados"
+        angulos = angulos_dinamicos(n, inicio, recorrido)
+        problema = problema_de_tomas(angulos, retardo)
+        if problema:
+            problema += (f". Con {recorrido:g} grados proba con "
+                         f"{tomas_validas_cercanas(n, recorrido, inicio, retardo)} tomas.")
+        return angulos, retardo, problema
+
+    def _revisar_config(self) -> None:
+        angulos, _retardo, problema = self._leer_config()
+        if problema:
+            self.lbl_config.config(text=problema, foreground=CYBER["alerta"])
+            self.btn_comenzar.config(state="disabled")
+            return
+        paso = float(self.var_recorrido.get()) / len(angulos)
+        lista = ", ".join(f"{t:g}" for t in np.round(angulos[:12], 2))
+        if len(angulos) > 12:
+            lista += f", ... ({len(angulos) - 12} mas)"
+        self.lbl_config.config(
+            text=f"{len(angulos)} tomas, paso de {paso:g} grados\n"
+                 f"angulos de la lamina: {lista}\n"
+                 "(al pasar de 360 se vuelve a contar desde 0)",
+            foreground=CYBER["texto"])
+        self.btn_comenzar.config(state="normal")
+
+    def _comenzar_dinamico(self) -> None:
+        angulos, retardo, problema = self._leer_config()
+        if problema:
+            return
+        self.metodo, self.angulos, self.retardo = "dinamico", angulos, retardo
+        self.pasos = pasos_dinamicos(angulos)
+        self._pantalla_medida()
+
+    # --- pantalla 3: guia de medida, para los dos metodos ---
+
+    def _pantalla_medida(self) -> None:
         tk, ttk = self.tk, self.ttk
         self._limpiar()
         self.medidas.clear()
@@ -384,6 +609,10 @@ class PolarimetroGUI:
 
         ttk.Button(izq, text="< volver a los metodos",
                    command=self._pantalla_metodos).pack(fill="x")
+        ttk.Label(izq, text=(f"METODO DINAMICO  {len(self.pasos)} tomas"
+                             if self.metodo == "dinamico" else "METODO ESTATICO  4 medidas"),
+                  font=("Consolas", 9, "bold"), foreground=CYBER["neon2"]
+                  ).pack(anchor="w", pady=(6, 0))
 
         f = ttk.LabelFrame(izq, text="Camara", padding=6)
         f.pack(fill="x", pady=(8, 0))
@@ -420,8 +649,11 @@ class PolarimetroGUI:
         self.lbl_montaje = ttk.Label(f, text="", font=("Consolas", 9), justify="left",
                                      wraplength=280)
         self.lbl_montaje.pack(anchor="w", pady=(6, 0))
-        ttk.Label(f, text="orden del haz:\nluz -> cuarto de onda -> analizador -> camara",
-                  font=("Consolas", 8), foreground=CYBER["tenue"], justify="left"
+        ttk.Label(f, text="orden del haz:\nluz -> cuarto de onda -> "
+                          + ("polarizador fijo" if self.metodo == "dinamico" else "analizador")
+                          + " -> camara",
+                  font=("Consolas", 8), foreground=CYBER["tenue"], justify="left",
+                  wraplength=280
                   ).pack(anchor="w", pady=(8, 0))
 
         self.btn_tomar = ttk.Button(izq, text="Tomar fotografia", style="Neon.TButton",
@@ -433,7 +665,8 @@ class PolarimetroGUI:
         f = ttk.LabelFrame(izq, text="Serie", padding=6)
         f.pack(fill="both", pady=(8, 0))
         cols = ("n", "qwp", "analiz", "estado")
-        self.tabla = self.ttk.Treeview(f, columns=cols, show="headings", height=4)
+        self.tabla = self.ttk.Treeview(f, columns=cols, show="headings",
+                                       height=min(len(self.pasos), 8))
         for c, a in zip(cols, (30, 90, 60, 80)):
             self.tabla.heading(c, text=c)
             self.tabla.column(c, width=a, anchor="w")
@@ -562,7 +795,7 @@ class PolarimetroGUI:
                 texto += " Dark frame quitado: ya no corresponde."
             aviso = aviso_de_offset(self.cam.valores["negro"], self.dark)
             self.lbl_aviso.config(text=f"{texto} {aviso}".strip())
-        elif self.medidas and self.paso_actual < len(PASOS_ESTATICO):
+        elif self.medidas and self.paso_actual < len(self.pasos):
             # Las cuatro fotos tienen que salir de la misma cadena de imagen.
             self.lbl_aviso.config(text="Cambiaste un ajuste con la serie empezada: "
                                        "repite las medidas ya tomadas.")
@@ -639,28 +872,36 @@ class PolarimetroGUI:
 
     def _refrescar_paso(self) -> None:
         """Escribe la instruccion de montaje del paso que toca."""
-        listo = len(self.medidas) == len(PASOS_ESTATICO)
+        listo = len(self.medidas) == len(self.pasos)
         if listo:
             self.lbl_paso.config(text="serie completa")
             self.lbl_montaje.config(
-                text="Ya estan las cuatro medidas.\nPodes repetir alguna o exportar.")
+                text=f"Ya estan las {len(self.pasos)} medidas.\nPodes repetir alguna o exportar.")
         else:
-            paso = PASOS_ESTATICO[self.paso_actual]
-            self.lbl_paso.config(text=f"MEDIDA {paso.n} de {len(PASOS_ESTATICO)}")
-            self.lbl_montaje.config(
-                text=f"Cuarto de onda:\n  {paso.qwp}\n\n"
-                     f"Polarizador lineal (analizador):\n  {paso.analizador:.0f} grados\n\n"
-                     f"{paso.formula}")
+            paso = self.pasos[self.paso_actual]
+            self.lbl_paso.config(text=f"MEDIDA {paso.n} de {len(self.pasos)}")
+            if self.metodo == "dinamico":
+                self.lbl_montaje.config(
+                    text=f"Cuarto de onda (gira):\n  {paso.qwp}\n\n"
+                         f"Polarizador lineal (fijo):\n  0 grados\n\n{paso.formula}")
+            else:
+                self.lbl_montaje.config(
+                    text=f"Cuarto de onda:\n  {paso.qwp}\n\n"
+                         f"Polarizador lineal (analizador):\n  {paso.analizador:.0f} grados\n\n"
+                         f"{paso.formula}")
         self.btn_tomar.config(state="disabled" if listo else "normal")
         self.btn_repetir.config(state="normal" if self.medidas else "disabled")
         self.btn_exportar.config(state="normal" if listo else "disabled")
 
         self.tabla.delete(*self.tabla.get_children())
-        for i, paso in enumerate(PASOS_ESTATICO):
+        for i, paso in enumerate(self.pasos):
             estado = ("tomada" if paso.n in self.medidas else
                       "<- ahora" if i == self.paso_actual and not listo else "pendiente")
-            self.tabla.insert("", "end", values=(
-                paso.n, paso.qwp.split(",")[0], f"{paso.analizador:.0f}d", estado))
+            qwp = paso.qwp.replace("eje rapido a ", "").split(",")[0]
+            self.tabla.insert("", "end", iid=str(paso.n), values=(
+                paso.n, qwp, f"{paso.analizador:.0f}d", estado))
+        if not listo:
+            self.tabla.see(str(self.pasos[self.paso_actual].n))
 
     def tomar(self) -> None:
         from tkinter import messagebox
@@ -669,7 +910,7 @@ class PolarimetroGUI:
         if f is None:
             messagebox.showinfo("Sin imagen", "Inicia el visor primero.")
             return
-        paso = PASOS_ESTATICO[self.paso_actual]
+        paso = self.pasos[self.paso_actual]
         # Se guarda la intensidad escalar: los Stokes se definen sobre la
         # potencia total, no sobre cada canal de color por separado.
         intensidad = f.mean(axis=2) if f.ndim == 3 else f
@@ -681,7 +922,7 @@ class PolarimetroGUI:
                 "el submuestreo. Vuelve a ese ajuste o repite la serie.")
             return
         self.medidas[paso.n] = intensidad
-        if self.paso_actual < len(PASOS_ESTATICO) - 1:
+        if self.paso_actual < len(self.pasos) - 1:
             self.paso_actual += 1
         self._recalcular()
         self._refrescar_paso()
@@ -705,6 +946,9 @@ class PolarimetroGUI:
         """
         self._version += 1          # invalida los mapas cacheados
         self._cache.clear()
+        if self.metodo == "dinamico":
+            self._recalcular_dinamico()
+            return
         if len(self.medidas) < 3:
             self.params = None
             self.lbl_pol.config(
@@ -714,21 +958,54 @@ class PolarimetroGUI:
         completa = 4 in self.medidas
         i4 = self.medidas[4] if completa else 0.5 * (i1 + i3)   # S3 = 0
         self.params = parametros(stokes_desde_intensidades(i1, i2, i3, i4))
+        self._mostrar_resumen("completa: S0..S3 con circular" if completa
+                              else "parcial: falta la medida 4, S3 = 0")
+
+    def _recalcular_dinamico(self) -> None:
+        """Ajusta los Stokes con las tomas que haya, si ya alcanzan para separarlos.
+
+        No hace falta esperar la serie entera: en cuanto las tomas hechas separan
+        los cuatro parametros se muestra la imagen, y mejora con cada toma.
+        """
+        tomadas = sorted(self.medidas)
+        angulos = [self.angulos[n - 1] for n in tomadas]
+        if len(tomadas) < 4 or problema_de_tomas(angulos, self.retardo):
+            self.params = None
+            self.lbl_pol.config(
+                text=f"{len(tomadas)} de {len(self.pasos)} tomas: todavia no alcanzan "
+                     "para separar S0..S3", foreground=CYBER["tenue"])
+            return
+        stokes, residuo = stokes_dinamico([self.medidas[n] for n in tomadas], angulos,
+                                          self.retardo)
+        self.params = parametros(stokes)
+        val = self._pixeles_con_senal()
+        res = float(np.nanmean(residuo[val])) if val is not None and val.any() else 0.0
+        texto = ("completa" if len(tomadas) == len(self.pasos)
+                 else f"parcial: {len(tomadas)} de {len(self.pasos)} tomas")
+        aviso = (f"\nresiduo del ajuste {res * 100:.1f}%: revisa los angulos de la lamina "
+                 "o si la luz cambio" if res > UMBRAL_RESIDUO else "")
+        self._mostrar_resumen(f"{texto}, residuo {res * 100:.1f}%", aviso)
+
+    def _pixeles_con_senal(self) -> np.ndarray | None:
         p = self.params
-        val = p["S0"] > np.nanmax(p["S0"]) * UMBRAL_SENAL if np.nanmax(p["S0"]) > 0 else None
+        return p["S0"] > np.nanmax(p["S0"]) * UMBRAL_SENAL if np.nanmax(p["S0"]) > 0 else None
+
+    def _mostrar_resumen(self, estado: str, aviso: str = "") -> None:
+        """DOLP y azimut medios, y los avisos de que la serie no es consistente."""
+        p = self.params
+        val = self._pixeles_con_senal()
         hay = val is not None and val.any()
         dolp = float(np.nanmean(p["DOLP"][val])) if hay else 0.0
         azim = float(np.nanmean(p["azimut"][val])) if hay else 0.0
-        # Un DOP mayor que 1 es fisicamente imposible: si aparece, las cuatro
-        # fotos no corresponden al mismo estado. Tipicamente porque la luz
-        # cambio entre tomas, algo se movio, o hubo pixeles saturados.
+        # Un DOP mayor que 1 es fisicamente imposible: si aparece, las fotos no
+        # corresponden al mismo estado. Tipicamente porque la luz cambio entre
+        # tomas, algo se movio, o hubo pixeles saturados.
         dop_max = float(np.nanmax(p["DOP"][val])) if hay else 0.0
-        aviso = ("\n¡DOP max %.2f > 1! imposible: luz variable, algo se movio "
-                 "o saturacion" % dop_max) if dop_max > 1.05 else ""
+        if dop_max > 1.05:
+            aviso += ("\n¡DOP max %.2f > 1! imposible: luz variable, algo se movio "
+                      "o saturacion" % dop_max)
         self.lbl_pol.config(
-            text=(f"DOLP medio {dolp:.3f}   azimut medio {azim:.1f} deg\n"
-                  + ("completa: S0..S3 con circular" if completa
-                     else "parcial: falta la medida 4, S3 = 0") + aviso),
+            text=f"DOLP medio {dolp:.3f}   azimut medio {azim:.1f} deg\n{estado}{aviso}",
             foreground=CYBER["alerta"] if aviso else CYBER["tenue"])
 
     # --- modos de visualizacion ---
@@ -927,15 +1204,19 @@ class PolarimetroGUI:
 
     def exportar(self) -> None:
         from tkinter import filedialog, messagebox
-        if self.params is None or len(self.medidas) < len(PASOS_ESTATICO):
-            messagebox.showinfo("Faltan medidas", "Completa las cuatro medidas primero.")
+        if self.params is None or len(self.medidas) < len(self.pasos):
+            messagebox.showinfo("Faltan medidas",
+                                f"Completa las {len(self.pasos)} medidas primero.")
             return
         carpeta = filedialog.askdirectory(title="Carpeta donde exportar")
         if not carpeta:
             return
         try:
+            extra = ({"angulo_qwp_deg": self.angulos,
+                      "retardo_deg": np.float64(self.retardo)}
+                     if self.metodo == "dinamico" else None)
             escritos = exportar(Path(carpeta), self.medidas, self.params,
-                                self.var_formato.get())
+                                self.var_formato.get(), extra)
         except (ValueError, OSError) as e:
             messagebox.showerror("No se pudo exportar", str(e))
             return
@@ -1209,6 +1490,135 @@ def test_exportar_escribe_fotos_stokes_y_falso_color(tmp_path):
     guardado = np.load([f for f in escritos if f.suffix == ".npz"][0])
     assert np.allclose(guardado["S1"], 200.0)       # float64, sin cuantizar
     assert guardado["azimut"].dtype == np.float64
+
+
+# --- metodo dinamico ---
+
+def _tomas(stokes, angulos, retardo=RETARDO_QWP):
+    """Simula las tomas del dinamico con el producto de Mueller, no con la formula."""
+    return [fila_dinamica(t, retardo) @ np.asarray(stokes, dtype=np.float64) for t in angulos]
+
+
+def test_el_dinamico_usa_la_misma_convencion_que_el_estatico():
+    # El paso 4 del estatico armado con matrices de Mueller (lamina a 0, analizador
+    # a 45) da lo mismo que la (6-6): el signo de S3 es el mismo en los dos metodos.
+    for nombre, s in ESTADOS.items():
+        s = np.array(s, dtype=np.float64)
+        m = (mueller_polarizador(45.0) @ mueller_retardador(0.0, 90.0) @ s)[0]
+        assert np.isclose(m, intensidad_teorica(s, 45.0, 90.0)), nombre
+        for t in (0.0, 30.0, 90.0):          # sin lamina, Malus
+            assert np.isclose((mueller_polarizador(t) @ s)[0], intensidad_teorica(s, t, 0.0))
+
+
+def test_la_fila_dinamica_es_la_modulacion_de_goldstein():
+    rng = np.random.default_rng(7)
+    for _ in range(20):
+        s = rng.normal(size=4)
+        a, b, c, d = s[0] + s[1] / 2, s[3], s[1] / 2, s[2] / 2
+        t = np.deg2rad(rng.uniform(0, 360))
+        esperado = 0.5 * (a - b * np.sin(2 * t) + c * np.cos(4 * t) + d * np.sin(4 * t))
+        assert np.isclose(fila_dinamica(np.rad2deg(t)) @ s, esperado)
+
+
+def test_con_pasos_iguales_da_las_sumas_de_fourier_del_libro():
+    for n, recorrido in ((16, 180.0), (36, 360.0)):
+        ang = angulos_dinamicos(n, 0.0, recorrido)
+        s = np.array([2.0, 0.3, -0.5, 0.8])
+        i = np.array(_tomas(s, ang))
+        t = np.deg2rad(ang)
+        a = 2 / n * i.sum()
+        b = -4 / n * (i * np.sin(2 * t)).sum()
+        c = 4 / n * (i * np.cos(4 * t)).sum()
+        d = 4 / n * (i * np.sin(4 * t)).sum()
+        fourier = np.array([a - c, 2 * c, 2 * d, b])
+        ajuste, _ = stokes_dinamico(i, ang)
+        assert np.allclose(ajuste, fourier) and np.allclose(ajuste, s)
+
+
+def test_el_dinamico_recupera_cada_estado_de_referencia():
+    series = [(n, 360.0) for n in (5, 7, 9, 16, 36)] + [(n, 180.0) for n in (5, 8, 12)]
+    for n, recorrido in series:
+        for inicio in (0.0, 37.5, 350.0):
+            ang = angulos_dinamicos(n, inicio, recorrido)
+            for nombre, s in ESTADOS.items():
+                got, residuo = stokes_dinamico(_tomas(s, ang), ang)
+                assert np.allclose(got, s, atol=1e-9), (nombre, n, recorrido, inicio)
+                assert residuo < 1e-9
+                dop = parametros(got)["DOP"]
+                assert np.isclose(dop, 0.0 if nombre == "sin polarizar" else 1.0, atol=1e-9)
+
+
+def test_los_angulos_vuelven_a_contar_desde_cero_al_pasar_360():
+    ang = angulos_dinamicos(8, 300.0, 360.0)
+    assert np.allclose(ang[:3], [300.0, 345.0, 30.0])
+    assert ((0 <= ang) & (ang < 360)).all()
+    assert np.allclose(angulos_dinamicos(4, 0.0, 180.0), [0.0, 45.0, 90.0, 135.0])
+
+
+def test_no_todo_numero_de_tomas_separa_los_cuatro_stokes():
+    def sirve(n, r):
+        return problema_de_tomas(angulos_dinamicos(n, 0.0, r)) == ""
+    assert not any(sirve(n, 360.0) for n in (4, 6, 8))     # sin 4theta se anula o se pliega
+    assert all(sirve(n, 360.0) for n in (5, 7, 9, 10, 16))
+    assert not sirve(4, 180.0) and all(sirve(n, 180.0) for n in (5, 6, 8))
+    assert tomas_validas_cercanas(8, 360.0) in (7, 9)
+    assert tomas_validas_cercanas(4, 180.0) == 5
+    import pytest
+    with pytest.raises(ValueError):
+        stokes_dinamico([1.0] * 8, angulos_dinamicos(8, 0.0, 360.0))
+
+
+def test_un_retardo_mal_supuesto_sesga_los_stokes_sin_dejar_residuo():
+    # Con otro retardo la modulacion tiene los mismos terminos (1, sin2t, cos4t,
+    # sin4t), solo con otros pesos: el ajuste cierra perfecto y los Stokes salen
+    # corridos. Por eso el retardo de la lamina hay que conocerlo; el residuo no avisa.
+    s = np.array([1.0, 0.2, -0.4, 0.7])
+    ang = angulos_dinamicos(16, 0.0, 360.0)
+    medidas = _tomas(s, ang, retardo=80.0)
+    bien, res_bien = stokes_dinamico(medidas, ang, 80.0)
+    mal, res_mal = stokes_dinamico(medidas, ang, 90.0)
+    assert np.allclose(bien, s) and res_bien < 1e-9
+    assert not np.allclose(mal, s, atol=0.02) and res_mal < 1e-9
+
+
+def test_el_residuo_crece_con_un_angulo_mal_puesto():
+    s = np.array([1.0, 0.3, 0.5, 0.6])
+    ang = angulos_dinamicos(16, 0.0, 360.0)
+    residuos = []
+    for error in (0.0, 2.0, 10.0):           # la lamina quedo corrida en una toma
+        puestos = ang.copy()
+        puestos[5] += error
+        residuos.append(float(stokes_dinamico(_tomas(s, puestos), ang)[1]))
+    assert residuos[0] < 1e-12 < residuos[1] < residuos[2]
+
+
+def test_el_dinamico_funciona_pixel_a_pixel_y_sin_luz_no_da_nan():
+    ang = angulos_dinamicos(9, 0.0, 360.0)
+    s = np.zeros((4, 2, 3))
+    s[:, 0, 0] = ESTADOS["circular derecha"]
+    s[:, 1, 2] = ESTADOS["lineal +45"]
+    imgs = [np.tensordot(fila_dinamica(t), s, axes=1) for t in ang]
+    got, residuo = stokes_dinamico(imgs, ang)
+    assert got.shape == (4, 2, 3) and np.allclose(got, s, atol=1e-9)
+    assert not np.isnan(residuo).any() and not np.isnan(parametros(got)["DOP"]).any()
+
+
+def test_los_pasos_dinamicos_dejan_el_polarizador_fijo():
+    pasos = pasos_dinamicos(angulos_dinamicos(5, 350.0, 360.0))
+    assert [p.n for p in pasos] == [1, 2, 3, 4, 5]
+    assert all(p.analizador == 0.0 for p in pasos)
+    assert "350.0" in pasos[0].qwp and "62.0" in pasos[1].qwp
+
+
+def test_exportar_guarda_los_angulos_de_la_lamina(tmp_path):
+    ang = angulos_dinamicos(5, 0.0, 360.0)
+    medidas = {k + 1: np.full((2, 2), v) for k, v in enumerate(_tomas((1, 1, 0, 0), ang))}
+    stokes, _ = stokes_dinamico([medidas[n] for n in sorted(medidas)], ang)
+    escritos = exportar(tmp_path, medidas, parametros(stokes), ".npy",
+                        {"angulo_qwp_deg": ang, "retardo_deg": np.float64(90.0)})
+    guardado = np.load([f for f in escritos if f.suffix == ".npz"][0])
+    assert np.allclose(guardado["angulo_qwp_deg"], ang) and guardado["retardo_deg"] == 90.0
+    assert sum(f.name.startswith("medida") for f in escritos) == 5
 
 
 def test_todos_los_formatos_de_foto_son_validos():
