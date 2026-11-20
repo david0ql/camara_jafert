@@ -361,6 +361,40 @@ Se arregla subiendo **Nivel de negro** en *Ajustes > Imagen*: suma una constante
 que no rompe la linealidad. Con 50, a oscuras se mide R 3.1, G 9.0, B 3.1. El dark
 frame hay que capturarlo con ese mismo valor. Conviene guardarlo en un perfil.
 
+**Si la imagen sale negra** y ThorCam sí ve el patrón, suele faltar exposición o ganancia:
+el programa arranca en 20 ms y con las ganancias de fábrica. **Autoajustar luz**, en los
+dos programas, sube primero la exposición, después las tres ganancias por igual, y por
+último el nivel de negro si algún canal quedó recortado en cero. Deja esos valores fijos: no
+activa ningún modo automático, así que la respuesta sigue siendo lineal. Si termina diciendo
+*falta luz*, la cámara llegó a su límite (en la C1280R12C, unos 984 ms) y hay que revisar la
+fuente o el haz.
+
+**Después de autoajustar hay que capturar otro dark frame** con la tapa puesta: si algún valor
+cambió, el anterior ya no corresponde y el programa deja de restarlo. El nivel de negro suma
+la misma constante a todas las fotos, así que en el polarímetro S1, S2 y S3 no lo notan, pero
+sin restar el dark S0 sube y el DOP baja; la interfaz lo avisa. `polarimetro` lee `dark.npy` al
+abrir y no comprueba con qué ajustes se capturó: al cambiarlos, captura uno nuevo en `camara`.
+
+Pedir una exposición que no entra en el cuadro actual baja solos los cuadros por segundo y
+el pixel clock, que se recuperan al volver a una exposición corta. En ThorCam el color se ve
+más saturado porque usa saturación 164: multiplica R y vacía G y B, así que no sirve para medir.
+
+**Realzar en pantalla** quita el piso de cada canal y multiplica lo que se dibuja por el factor
+que muestra la casilla. Es solo para mirar: las lecturas, los archivos guardados y los Stokes
+siguen usando los valores reales.
+
+**El visor en vivo transmite en continuo**, como ThorCam, y muestra siempre el cuadro más
+reciente. Con la C1280R12C da unos 14 cuadros/s con el pixel clock de fábrica (24 MHz) y 25 con
+43 MHz (*Ajustes de cámara*), frente a 7 de la versión anterior. Nunca puede superar 1 ÷
+exposición: con 900 ms va a ~1 cuadro/s, así que para alinear conviene una exposición corta con
+**Realzar en pantalla**. Tras cada cambio de ajuste se descarta un cuadro, porque el sensor aplica
+el cambio con un cuadro de atraso. Con trigger externo o por software se captura foto a foto.
+
+**Los últimos ajustes se recuerdan** por cámara, en `%APPDATA%\camara_jafert`, y los dos programas
+los comparten. Al abrir se indica qué se cargó. No se recuerdan trigger, flash, PWM ni GPIO, y
+los valores pedidos por línea de comandos mandan sobre lo guardado. Para una medida, confirma
+la exposición y las ganancias que muestra la ficha.
+
 ## Plataformas
 
 La captura necesita el SDK **DCx Camera Support** de Thorlabs o el de **IDS uEye**,

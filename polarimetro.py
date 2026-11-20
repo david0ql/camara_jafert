@@ -51,10 +51,13 @@ from pathlib import Path
 import numpy as np
 
 from camara import (CYBER, TEXTO_DETECTAR, CapturaCancelada, Camera, ColaAjustes, Config,
-                    DRIVERS, FORMATOS, UC480Error, _aplicar_estilo, _ppm, abrir_ajustes,
+                    DRIVERS, FORMATOS, Promedio, UC480Error, _aplicar_estilo,
+                    _enganchar_consola, _ppm, abrir_ajustes,
                     accion_instalar_drivers, apply_dark, avisar_sin_camara, avisos_no_lineales,
-                    describir_camara, detectar_camaras, ficha_camara, load_dark, open_camera,
-                    panel_con_scroll, procesar_ajustes, save_frame_as)
+                    describir_camara, detectar_camaras, ficha_camara, guardar_ultimos,
+                    espera_hasta_proximo, imagen_de_pantalla, load_dark, open_camera,
+                    panel_con_scroll, pedir_autoluz,
+                    procesar_ajustes, restaurar_ultimos, save_frame_as, texto_ganancias, texto_negro)
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,14 @@ def intensidad_teorica(stokes, theta_deg: float, phi_deg: float) -> np.ndarray:
     return 0.5 * (s0 + s1 * np.cos(2 * th)
                   + s2 * np.sin(2 * th) * np.cos(ph)
                   + s3 * np.sin(2 * th) * np.sin(ph))
+
+
+def aviso_de_offset(negro: int, dark) -> str:
+    """El nivel de negro entra en las cuatro fotos: sin dark, S0 sube y el DOP baja."""
+    if negro and dark is None:
+        return (f"Nivel de negro {negro} sin dark frame: S0 y DOP quedan sesgados. "
+                "Captura uno en Camara con la tapa puesta y reabre este programa.")
+    return ""
 
 
 def stokes_desde_intensidades(i1, i2, i3, i4) -> np.ndarray:
@@ -276,6 +287,7 @@ class PolarimetroGUI:
         self.lock = threading.Lock()
         self.hilo: threading.Thread | None = None
         self.corriendo = threading.Event()
+        self.realce_on = True
         self.cola = ColaAjustes()
         self.win_ajustes = None
         self.medidas: dict[int, np.ndarray] = {}
@@ -291,6 +303,8 @@ class PolarimetroGUI:
         # Los mapas se recalculan solo cuando entra una medida, no en cada
         # cuadro: sobre 1280x1024 son varios ms que no hay por que gastar.
         self._version = 0
+        self._ultimo_frame: np.ndarray | None = None   # el que se dibujo por ultima vez
+        self._ultima_vista: tuple | None = None
         self._cache = {}
 
         root.title("Polarimetro - camara de polarizacion")
@@ -384,6 +398,8 @@ class PolarimetroGUI:
                    command=lambda: accion_instalar_drivers(self.root)).pack(fill="x", pady=(4, 0))
         ttk.Button(f, text="Ajustes de camara...",
                    command=lambda: abrir_ajustes(self.root, self)).pack(fill="x", pady=(4, 0))
+        ttk.Button(f, text="Autoajustar luz",
+                   command=lambda: pedir_autoluz(self)).pack(fill="x", pady=(4, 0))
         fila = ttk.Frame(f)
         fila.pack(fill="x", pady=(6, 0))
         self.btn_iniciar = ttk.Button(fila, text="Iniciar visor", style="Neon.TButton",
@@ -391,6 +407,10 @@ class PolarimetroGUI:
         self.btn_iniciar.pack(side="left", fill="x", expand=True)
         self.btn_detener = ttk.Button(fila, text="Detener", command=self.detener)
         self.btn_detener.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        self.var_realce = tk.BooleanVar(value=self.realce_on)
+        self.chk_realce = ttk.Checkbutton(f, text="Realzar en pantalla",
+                                          variable=self.var_realce, command=self._cambiar_realce)
+        self.chk_realce.pack(anchor="w", pady=(6, 0))
 
         f = ttk.LabelFrame(izq, text="Montaje para esta medida", padding=6)
         f.pack(fill="x", pady=(8, 0))
@@ -497,8 +517,20 @@ class PolarimetroGUI:
             from dataclasses import replace
             self.cfg = replace(self.cfg, demo=True)
             self.cam = open_camera(self.cfg)
+        self.realce_on, aviso = restaurar_ultimos(self.cam, self.cfg)
+        self.var_realce.set(self.realce_on)
         self.root.title(f"Polarimetro - {self.cam.marca} {self.cam.model}")
         self._actualizar_ficha()
+        if aviso:
+            actual = self.lbl_aviso.cget("text")
+            self.lbl_aviso.config(text=f"{aviso}\n{actual}" if actual else aviso)
+
+    def _cambiar_realce(self) -> None:
+        self.realce_on = bool(self.var_realce.get())
+        if not self.realce_on:
+            self.chk_realce.config(text="Realzar en pantalla")
+        if self.cam is not None:
+            guardar_ultimos(self.cam, self.realce_on)
 
     def _actualizar_ficha(self) -> None:
         cam = self.cam
@@ -506,18 +538,30 @@ class PolarimetroGUI:
             return
         self.lbl_cam.config(
             text=f"{ficha_camara(cam)}\n{cam.width}x{cam.height}   "
-                 f"exp {cam.exposure_ms:.2f} ms",
+                 f"exp {cam.exposure_ms:.2f} ms   {texto_negro(cam)}\n"
+                 f"ganancia {texto_ganancias(cam)}",
             foreground=CYBER["neon2"] if self.cfg.demo else CYBER["ok"])
         avisos = avisos_no_lineales(cam.valores)
         # Stokes se calcula con diferencias de intensidad: sin linealidad no sirve.
-        self.lbl_aviso.config(text="Fuera de la cadena lineal, los Stokes no valen: "
-                                   + ", ".join(avisos) if avisos else "")
+        textos = ["Fuera de la cadena lineal, los Stokes no valen: " + ", ".join(avisos)
+                  if avisos else "", aviso_de_offset(cam.valores["negro"], self.dark)]
+        self.lbl_aviso.config(text="\n".join(t for t in textos if t))
 
     def ajuste_aplicado(self, clave: str, res) -> None:
         """El hilo de captura aplico un ajuste: se refresca la ficha."""
+        if self.cam is not None:
+            guardar_ultimos(self.cam, self.realce_on)
         self._actualizar_ficha()
         if isinstance(res, Exception):
             self.lbl_aviso.config(text=str(res))
+        elif clave == ColaAjustes.AUTOLUZ and not self.medidas:
+            texto = str(res)
+            if self.dark is not None and self.cam.luz_cambio:
+                # Se aplica siempre que exista: con otros ajustes falsearia los Stokes.
+                self.dark = None
+                texto += " Dark frame quitado: ya no corresponde."
+            aviso = aviso_de_offset(self.cam.valores["negro"], self.dark)
+            self.lbl_aviso.config(text=f"{texto} {aviso}".strip())
         elif self.medidas and self.paso_actual < len(PASOS_ESTATICO):
             # Las cuatro fotos tienen que salir de la misma cadena de imagen.
             self.lbl_aviso.config(text="Cambiaste un ajuste con la serie empezada: "
@@ -533,6 +577,7 @@ class PolarimetroGUI:
         from tkinter import messagebox
         self.detener()
         if self.cam is not None:
+            guardar_ultimos(self.cam, self.realce_on)
             self.cam.close()
             self.cam = None
         try:
@@ -573,23 +618,22 @@ class PolarimetroGUI:
             if cam is None:
                 return
             self.cola.drenar(cam)
-            pila = []
+            prom = Promedio()
             for _ in range(cfg.average):
                 if not self.corriendo.is_set():
                     return
                 try:
-                    pila.append(cam.grab().astype(np.float64))
+                    prom.agregar(cam.grab())
                 except CapturaCancelada:
                     return
                 except UC480Error:
                     pass
-            if not pila:
+            f = prom.resultado()
+            if f is None:
                 continue
-            f = np.mean(pila, axis=0)
-            if f.ndim == 2:
-                f = np.repeat(f[:, :, None], 3, axis=2)
+            f = apply_dark(f, self.dark, en_sitio=True)
             with self.lock:
-                self.frame = apply_dark(f, self.dark)
+                self.frame = f
 
     # --- serie de medidas ---
 
@@ -823,12 +867,24 @@ class PolarimetroGUI:
 
     def _tick(self) -> None:
         self._tick_id = None
+        t0 = time.perf_counter()
         if not self.canvas.winfo_exists():
             return                     # cambiamos de pantalla: el bucle termina
         with self.lock:
             f = self.frame
-        if f is not None:
-            self._pintar(self.canvas, np.clip(f, 0, 255).astype(np.uint8), "_img_id")
+        # Solo con cuadro nuevo o cambio de vista: redibujar lo mismo le quitaba
+        # procesador a la captura.
+        # El nombre del canvas cambia al rehacer la pantalla, y ahi hay que redibujar.
+        vista = (f is not None and f is self._ultimo_frame, self.realce_on, str(self.canvas),
+                 self.canvas.winfo_width(), self.canvas.winfo_height())
+        if f is not None and vista != self._ultima_vista:
+            self._ultimo_frame, self._ultima_vista = f, (True,) + vista[1:]
+            # Un frame reducido a la mitad alcanza: el canvas mide menos que eso.
+            disp, realce = imagen_de_pantalla(f[::2, ::2], self.realce_on)
+            self._pintar(self.canvas, disp, "_img_id")
+            texto = f"Realzar en pantalla  x{realce:.1f}"
+            if self.realce_on and self.chk_realce.cget("text") != texto:
+                self.chk_realce.config(text=texto)
         if self.params is not None and self.canvas_pol.winfo_exists():
             mapa = self._mapa_pol()
             if self.modo_elipse and self.pixel_sel is not None:
@@ -838,7 +894,8 @@ class PolarimetroGUI:
                                cv2.MARKER_CROSS, max(8, mapa.shape[1] // 40), 1)
             self._pintar(self.canvas_pol, mapa, "_pol_id")
         procesar_ajustes(self)
-        self._tick_id = self.root.after(self.INTERVALO_MS, self._tick)
+        self._tick_id = self.root.after(
+            espera_hasta_proximo(t0, time.perf_counter(), self.INTERVALO_MS), self._tick)
 
     def _pintar(self, canvas, bgr: np.ndarray, attr: str) -> None:
         """Escala el BGR al canvas y lo dibuja, igual que el visor de camara.py.
@@ -889,6 +946,7 @@ class PolarimetroGUI:
         self._parar_tick()
         self.detener()
         if self.cam is not None:
+            guardar_ultimos(self.cam, self.realce_on)
             self.cam.close()
         self.root.destroy()
 
@@ -910,6 +968,10 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     argv = sys.argv[1:] if argv is None else argv
+    if argv:
+        # Sin esto, en el .exe sin consola sys.stderr es None y --self-test se cae
+        # sin decir nada en cuanto pytest escribe ahi.
+        _enganchar_consola()
     p = argparse.ArgumentParser(
         description="Polarimetro de imagen para camaras Thorlabs DCx e IDS uEye.")
     p.add_argument("--demo", action="store_true", help="patron sintetico, sin hardware")
@@ -949,6 +1011,18 @@ ESTADOS = {
     "circular izquierda": (1, 0, 0, -1),
     "sin polarizar": (1, 0, 0, 0),
 }
+
+
+def test_un_offset_sin_restar_infla_s0_y_baja_el_dop():
+    # Por lo que avisa aviso_de_offset: S1, S2 y S3 son diferencias y no lo notan.
+    import pytest
+    s = np.array([100.0, 100.0, 0.0, 0.0])          # lineal horizontal, DOP 1
+    limpio = stokes_desde_intensidades(*_medir(s))
+    medido = stokes_desde_intensidades(*(i + 10.0 for i in _medir(s)))
+    assert medido[0] == pytest.approx(limpio[0] + 20.0)
+    assert medido[1:] == pytest.approx(limpio[1:])
+    assert aviso_de_offset(30, None) and "S0" in aviso_de_offset(30, None)
+    assert aviso_de_offset(30, np.zeros(1)) == "" and aviso_de_offset(0, None) == ""
 
 
 def _medir(stokes):

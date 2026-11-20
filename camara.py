@@ -70,6 +70,8 @@ WORD, DWORD, BOOL = C.c_uint16, C.c_uint32, C.c_int32
 # Constantes de uc480.h (DCx Camera Support) y uEye.h (IDS): coinciden en ambos.
 IS_SUCCESS = 0
 IS_WAIT = 0x0001
+IS_DONT_WAIT = 0x0000
+IS_FORCE_VIDEO_STOP = 0x4000
 IS_TIMED_OUT = 122
 IS_NOT_SUPPORTED = 155
 IS_TRANSFER_ERROR = 178
@@ -283,6 +285,79 @@ def format_sample(s: Sample, decimals: int, normalize: bool) -> list[str]:
     return lines
 
 
+# Autoajuste de luz. Son convenciones de lectura, no fisica: se busca que el pico de
+# la imagen quede alto en la escala de 8 bits sin llegar a saturar.
+AUTOLUZ_OBJETIVO = 200.0
+AUTOLUZ_MINIMO = 150.0
+AUTOLUZ_SATURA = 250.0
+AUTOLUZ_PASOS = 8
+AUTOLUZ_PERCENTIL = 99.9   # no el maximo: un pixel caliente no debe decidir la exposicion
+# Nivel de negro: se sube hasta que ningun canal quede recortado. Mirar solo el canal
+# mas brillante no alcanza: en la C1280R12C el verde nunca toca cero (su piso es 6) y
+# con poca luz empata con el rojo. Medido con ganancia 100: R deja de recortar con
+# negro 30 y B con unos 55, a un costo de pocas cuentas sobre 255.
+NEGRO_RECORTE_MAX = 0.01   # fraccion de pixeles en 0 que se tolera por canal
+NEGRO_PASO = 10
+NEGRO_MAX = 100            # mas alla ya no es un piso bajo el ADC: es otro problema
+REALCE_PISO = 1.0          # percentil que se toma como negro al realzar la pantalla
+REALCE_MAX = 16.0
+
+# Ganancia de hardware 0..100 como factor: ThorCam muestra 1x en 0 y 13x en 100 sobre
+# la C1280R12C. Es aproximado, y el autoajuste corrige midiendo en cada paso.
+GANANCIA_POR_PUNTO = 0.12
+
+
+def factor_de_ganancia(g: float) -> float:
+    return 1.0 + GANANCIA_POR_PUNTO * g
+
+
+def ganancia_de_factor(k: float) -> int:
+    return int(round(min(max((k - 1.0) / GANANCIA_POR_PUNTO, 0.0), 100.0)))
+
+
+def pico_de_frame(frame: np.ndarray) -> float:
+    """Brillo del canal mas alto, ignorando los pixeles calientes."""
+    return float(np.percentile(frame, AUTOLUZ_PERCENTIL, axis=(0, 1)).max())
+
+
+def fraccion_recortada(frame: np.ndarray) -> float:
+    """La mayor fraccion de pixeles en 0 entre los canales de la imagen."""
+    return float(np.max(np.mean(frame <= 0, axis=(0, 1))))
+
+
+def plan_negro(recorte: float, negro: int) -> int | None:
+    """Siguiente nivel de negro, o None si no hay recorte o ya se llego al tope."""
+    if recorte <= NEGRO_RECORTE_MAX or negro >= NEGRO_MAX:
+        return None
+    return min(negro + NEGRO_PASO, NEGRO_MAX)
+
+
+def plan_autoluz(pico: float, exp_ms: float, exp_min: float, exp_max: float,
+                 factor_libre: float) -> tuple[float, float] | None:
+    """Siguiente paso: (exposicion, factor de ganancia), o None si no hay nada que hacer.
+
+    Primero la exposicion y solo despues la ganancia, que amplifica tambien el ruido.
+    """
+    if AUTOLUZ_MINIMO <= pico <= AUTOLUZ_SATURA:
+        return None
+    # Saturado no dice cuanto sobra: solo que hay que bajar.
+    falta = 0.5 if pico > AUTOLUZ_SATURA else AUTOLUZ_OBJETIVO / max(pico, 1.0)
+    nueva = min(max(exp_ms * falta, exp_min), exp_max)
+    factor = min(falta * exp_ms / nueva, factor_libre)
+    if abs(nueva - exp_ms) < 1e-3 * exp_ms and abs(factor - 1.0) < 0.01:
+        return None
+    return nueva, factor
+
+
+def reloj_para_exposicion(ms: float, clk: int, cuadro_max_ms: float, clk_min: int) -> int:
+    """Reloj mas alto cuyo cuadro mas largo admite esta exposicion.
+
+    El cuadro mas largo crece como 1/reloj (medido en la C1280R12C: 205 ms a 24 MHz,
+    615 ms a 8 MHz). El margen cubre lo que el sensor reserva entre cuadros.
+    """
+    return max(clk_min, min(clk, int(clk * cuadro_max_ms / (ms * 1.01))))
+
+
 class Camera(Protocol):
     width: int
     height: int
@@ -290,6 +365,8 @@ class Camera(Protocol):
 
     def grab(self) -> np.ndarray: ...
     def set_exposure(self, ms: float) -> float: ...
+    def pedir_exposicion(self, ms: float) -> float: ...
+    def autoajustar_luz(self) -> str: ...
     def exposure_range(self) -> tuple[float, float]: ...
     def ajustes(self) -> dict: ...
     def aplicar_ajuste(self, clave: str, valor): ...
@@ -633,6 +710,21 @@ def avisar_sin_camara(root, detalle: str = "") -> None:
                           lambda: resumir_reparacion(reparar_drivers()))
     else:
         _en_segundo_plano(root, "Buscar drivers", buscar_drivers_en_internet)
+
+
+# Video continuo: buffers en la cola del SDK y tramo maximo de cada espera, para
+# que Detener no quede esperando un cuadro de casi un segundo.
+BUFFERS_VIVO = 4
+TRAMO_ESPERA_MS = 200
+# El sensor aplica un cambio con un cuadro de atraso, aun reiniciando el video: medido
+# en la C1280R12C, pasar de 4 a 0.4 ms dio 65 en el primer cuadro y 5.9 en el segundo.
+DESCARTE_AL_ARRANCAR = 1
+
+
+def espera_de_cuadro_ms(exposicion_ms: float, fps: float) -> int:
+    """Cuanto esperar un cuadro antes de darlo por perdido: dos periodos y medio segundo."""
+    periodo = max(1000.0 / fps if fps > 0 else 1000.0, exposicion_ms)
+    return int(2 * periodo + 500)
 
 
 class UC480_CAMERA_INFO(C.Structure):
@@ -1019,7 +1111,7 @@ def construir_ajustes(cap: dict, v: dict) -> dict[str, Ajuste]:
     add("fps_hold", P_CAMARA, "Cuadros", "Mantener al cambiar el reloj", "bool")
     add("fps_max", P_CAMARA, "Cuadros", "Maximo", "bool")
     rango("exposicion", P_CAMARA, "Exposicion", "Exposicion (ms)", cap.get("exposicion"),
-          nota="la exposicion larga exige bajar antes los cuadros por segundo")
+          nota="si no entra en el cuadro actual, se bajan cuadros y reloj solos")
     add("exp_hold", P_CAMARA, "Exposicion", "Mantener al cambiar el reloj", "bool")
     add("exp_max", P_CAMARA, "Exposicion", "Maximo", "bool")
     add("exp_auto", P_CAMARA, "Exposicion", "Automatica", "bool")
@@ -1154,6 +1246,58 @@ class AjustesMixin:
         elif clave in ("exp_max", "exp_larga"):
             self._reaplicar_exposicion()
 
+    def autoajustar_luz(self) -> str:
+        """Lleva la imagen a escala midiendo, y deja los valores fijos.
+
+        No usa los modos automaticos del sensor: cambiarian la respuesta entre dos
+        medidas. Exposicion, ganancias y nivel de negro constantes conservan la
+        linealidad, y las tres ganancias suben por igual para no alterar el balance
+        entre canales. El negro va al final porque el recorte depende de los otros dos.
+        Deja en luz_cambio si toco algo: un dark frame anterior ya no corresponde.
+        """
+        if self.valores["trigger_modo"].startswith("flanco"):
+            raise UC480Error("el autoajuste necesita la camara sin trigger externo")
+        puede_negro = self.ajustes()["negro"].activo and not self.valores.get("negro_auto")
+        claves_luz = ("exposicion", "negro", *self._claves_de_ganancia())
+        antes = [self.valores[c] for c in claves_luz]
+        pico, recorte = 0.0, 0.0
+        for _ in range(AUTOLUZ_PASOS + NEGRO_MAX // NEGRO_PASO):
+            if self._cancelar.is_set():
+                raise CapturaCancelada("autoajuste cancelado")
+            self.grab()     # este cuadro se empezo a exponer antes del ultimo cambio
+            frame = self.grab()
+            pico, recorte = pico_de_frame(frame), fraccion_recortada(frame)
+            lo, hi, _paso = self.cap["exposicion"]
+            claves = self._claves_de_ganancia()
+            factores = [factor_de_ganancia(self.valores[c]) for c in claves]
+            libre = factor_de_ganancia(100) / max(factores) if factores else 1.0
+            plan = plan_autoluz(pico, self.exposure_ms, lo, hi, libre)
+            if plan is not None:
+                self.aplicar_ajuste("exposicion", plan[0])
+                for c, k in zip(claves, factores):
+                    self.aplicar_ajuste(c, ganancia_de_factor(k * plan[1]))
+                continue
+            negro = plan_negro(recorte, int(self.valores["negro"])) if puede_negro else None
+            if negro is None:
+                break
+            self.aplicar_ajuste("negro", negro)
+        self.luz_cambio = antes != [self.valores[c] for c in claves_luz]
+        resumen = (f"Autoajuste: {self.exposure_ms:.1f} ms, {self.fps:.1f} fps, "
+                   f"ganancia {texto_ganancias(self)}, {texto_negro(self)}; "
+                   f"pico {pico:.0f}/255")
+        if pico < AUTOLUZ_MINIMO:
+            resumen += ". Camara al limite: falta luz"
+        elif pico > AUTOLUZ_SATURA:
+            resumen += ". Satura: reduce la luz"
+        if puede_negro and recorte > NEGRO_RECORTE_MAX:
+            resumen += f". Sigue recortado el {recorte * 100:.0f}% de un canal"
+        return resumen + "."
+
+    def _claves_de_ganancia(self) -> tuple[str, ...]:
+        if self.cap.get("rgb"):
+            return ("ganancia_r", "ganancia_g", "ganancia_b")
+        return ("ganancia",) if self.cap.get("master") else ()
+
     def restablecer(self) -> list[str]:
         """Vuelve a la cadena lineal. Devuelve lo que no se pudo restablecer."""
         objetivo = {**DEFECTOS, **self.defectos_camara}
@@ -1193,13 +1337,40 @@ class AjustesMixin:
             self.valores["exposicion"] = self.set_exposure(self.valores["exposicion"])
 
 
+def queda_margen_de_luz(cam) -> bool:
+    """Si el autoajuste todavia podria subir la exposicion o alguna ganancia."""
+    if cam.exposure_ms < cam.cap["exposicion"][1] * 0.99:
+        return True
+    # Suben por igual para conservar el balance: frena la que llegue primero al tope.
+    return max((cam.valores[c] for c in cam._claves_de_ganancia()), default=100) < 100
+
+
+def texto_negro(cam) -> str:
+    return "negro auto" if cam.valores.get("negro_auto") else f"negro {cam.valores['negro']}"
+
+
+def texto_ganancias(cam) -> str:
+    """Las ganancias vigentes, para mostrarlas sin abrir la ventana de ajustes."""
+    return " ".join(f"{c.split('_')[-1]}={cam.valores[c]}" for c in cam._claves_de_ganancia())
+
+
 def guardar_perfil(cam, ruta: Path) -> Path:
     """Guarda los ajustes de la camara en JSON, como Save Camera Settings de ThorCam."""
     datos = {"marca": getattr(cam, "marca", ""), "modelo": getattr(cam, "model", ""),
-             "ajustes": {k: v for k, v in cam.valores.items()
-                         if k in cam.ajustes() and v is not None}}
+             "ajustes": _valores_a_guardar(cam)}
     ruta.write_text(json.dumps(datos, indent=2, ensure_ascii=False), encoding="utf-8")
     return ruta
+
+
+def _valores_a_guardar(cam) -> dict:
+    tabla = cam.ajustes()
+    valores = {k: v for k, v in dict(cam.valores).items() if k in tabla and v is not None}
+    # Si reloj y cuadros los bajo pedir_exposicion, se guarda lo que habia antes: al
+    # cargar los vuelve a bajar, y una exposicion corta los puede recuperar.
+    base = getattr(cam, "_tiempos_base", None)
+    if base is not None:
+        valores["pixel_clock"], valores["fps"] = base[0], base[1]
+    return valores
 
 
 def leer_perfil(ruta: Path) -> dict:
@@ -1211,6 +1382,66 @@ def leer_perfil(ruta: Path) -> dict:
         raise ValueError(f"{ruta.name} no es un perfil de ajustes") from e
 
 
+# Lo que no se restaura al abrir: un trigger guardado dejaria el visor esperando un
+# pulso sin explicacion, y flash, PWM y GPIO manejan equipo conectado a la camara.
+NO_RECORDAR = ("trigger_", "flash_", "pwm_", "gpio")
+
+
+def ruta_ultimos(cam) -> Path | None:
+    """Archivo de la ultima sesion de esta camara; la demo no tiene ninguno."""
+    if getattr(cam, "driver", "") == "demo":
+        return None
+    nombre = re.sub(r"[^\w.-]", "_", f"{cam.model}_{cam.serie}")
+    return Path(os.environ.get("APPDATA") or Path.home()) / "camara_jafert" / f"ultimos_{nombre}.json"
+
+
+def guardar_ultimos(cam, realce: bool, ruta: Path | None = None) -> None:
+    """Recuerda la sesion. Un disco lleno o sin permisos no debe frenar la captura."""
+    ruta = ruta or ruta_ultimos(cam)
+    if ruta is None:
+        return
+    datos = {"modelo": cam.model, "serie": cam.serie, "realce": realce,
+             "ajustes": {k: v for k, v in _valores_a_guardar(cam).items()
+                         if not k.startswith(NO_RECORDAR)}}
+    temporal = ruta.with_suffix(".tmp")
+    try:
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        temporal.write_text(json.dumps(datos, indent=2, ensure_ascii=False), encoding="utf-8")
+        temporal.replace(ruta)    # atomico: cerrar a mitad no deja el archivo roto
+    except OSError:
+        pass
+
+
+def _opciones_explicitas(cfg: Config) -> bool:
+    """Si se pidieron valores al arrancar, mandan sobre lo recordado."""
+    d = Config()
+    return any(getattr(cfg, c) != getattr(d, c)
+               for c in ("exposure_ms", "gain", "binning", "pixel_clock", "fps"))
+
+
+def restaurar_ultimos(cam, cfg: Config, ruta: Path | None = None) -> tuple[bool, str]:
+    """Aplica la ultima sesion. Devuelve (realce de pantalla, aviso para el usuario).
+
+    El aviso nombra lo cargado: una exposicion de la sesion anterior no debe colarse
+    en una medida sin que se note.
+    """
+    ruta = ruta or ruta_ultimos(cam)
+    if ruta is None or not ruta.exists():
+        return True, ""
+    try:
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        realce, ajustes = bool(datos.get("realce", True)), dict(datos["ajustes"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return True, ""     # un archivo roto equivale a no tener sesion anterior
+    if _opciones_explicitas(cfg):
+        return realce, ""
+    errores = cam.cargar_valores({k: v for k, v in ajustes.items()
+                                  if not k.startswith(NO_RECORDAR)})
+    aviso = (f"Ajustes de la ultima sesion: {cam.exposure_ms:.1f} ms, "
+             f"ganancia {texto_ganancias(cam)}, {texto_negro(cam)}")
+    return realce, aviso + (f". No se pudo cargar: {'; '.join(errores)}" if errores else "")
+
+
 class ColaAjustes:
     """Pedidos de la GUI, que aplica el hilo de captura entre dos frames.
 
@@ -1219,7 +1450,7 @@ class ColaAjustes:
     ultimo de cada clave, porque los intermedios ya no le importan a nadie.
     """
 
-    RESTABLECER, PERFIL = "__restablecer__", "__perfil__"
+    RESTABLECER, PERFIL, AUTOLUZ = "__restablecer__", "__perfil__", "__autoluz__"
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -1241,6 +1472,8 @@ class ColaAjustes:
                     res = cam.restablecer()
                 elif clave == self.PERFIL:
                     res = cam.cargar_valores(valor)
+                elif clave == self.AUTOLUZ:
+                    res = cam.autoajustar_luz()
                 else:
                     res = cam.aplicar_ajuste(clave, valor)
             except (UC480Error, ValueError, TypeError) as e:
@@ -1267,6 +1500,7 @@ class UC480Camera(AjustesMixin):
         self.transfer_errors = 0
         self.driver = self.DRIVER
         self._cancelar = threading.Event()
+        self._tiempos_base = None   # reloj y cuadros previos a alargar la exposicion
         self.dll = _cargar_dll(self.driver)
 
         self.h = C.c_uint32((info or {}).get("id", cfg.camera_id))
@@ -1320,7 +1554,7 @@ class UC480Camera(AjustesMixin):
             self.set_pixel_clock(cfg.pixel_clock)
         self.pixel_clock = self.get_pixel_clock()
         self.fps = self.set_fps(cfg.fps)
-        self.exposure_ms = self.set_exposure(cfg.exposure_ms)
+        self.exposure_ms = self.pedir_exposicion(cfg.exposure_ms)
         self.dll.is_SetTimeout(self.h, IS_TRIGGER_TIMEOUT, 3000)
         self._iniciar_valores()
 
@@ -1352,6 +1586,7 @@ class UC480Camera(AjustesMixin):
 
     def _reservar_buffer(self) -> None:
         """Mide el AOI actual y reserva el buffer para ese tamaño."""
+        self._parar_continuo()          # los buffers de la cola son del tamaño viejo
         r = IS_RECT()
         self._check(self.dll.is_AOI(self.h, IS_AOI_IMAGE_GET_AOI, C.byref(r), C.sizeof(r)),
                     "is_AOI")
@@ -1445,12 +1680,25 @@ class UC480Camera(AjustesMixin):
                                          C.byref(paso)) == IS_SUCCESS and tmin.value > 0:
             self.cap["fps"] = (1.0 / tmax.value, 1.0 / tmin.value, 0.01)
         lo, hi = self.exposure_range()
+        # El tope es lo que admite el reloj mas lento, no el cuadro de ahora:
+        # pedir_exposicion baja cuadros y reloj para llegar.
+        reloj, cuadro = self.cap.get("reloj"), self._cuadro_max_ms()
+        if reloj and cuadro and self.pixel_clock:
+            hi = max(hi, cuadro * self.pixel_clock / reloj[0])
         self.cap["exposicion"] = (lo, hi, max(self._exp_incremento(), 0.001))
         self.valores["pixel_clock"] = self.pixel_clock = self.get_pixel_clock()
         self.valores["fps"] = self.fps
         got = C.c_double()
         self.dll.is_Exposure(self.h, IS_EXPOSURE_CMD_GET, C.byref(got), 8)
         self.exposure_ms = self.valores["exposicion"] = got.value
+
+    def _cuadro_max_ms(self) -> float:
+        """El cuadro mas largo con el reloj actual; 0 si el SDK no lo informa."""
+        tmin, tmax, paso = C.c_double(), C.c_double(), C.c_double()
+        if self.dll.is_GetFrameTimeRange(self.h, C.byref(tmin), C.byref(tmax),
+                                         C.byref(paso)) != IS_SUCCESS:
+            return 0.0
+        return tmax.value * 1000.0
 
     def _exp_incremento(self) -> float:
         inc = C.c_double()
@@ -1460,7 +1708,10 @@ class UC480Camera(AjustesMixin):
     # --- cada ajuste, contra el SDK ---
 
     def _hw(self, clave: str, v):
+        self._parar_continuo()          # nada expuesto con el valor viejo llega despues
         d, h = self.dll, self.h
+        if clave in CLAVES_GEOMETRIA or clave in ("pixel_clock", "fps", "fps_max"):
+            self._tiempos_base = None    # manda lo que eligio el usuario
         if clave in CLAVES_GEOMETRIA:
             return self._aplicar_geometria()
         if clave == "pixel_clock":
@@ -1468,7 +1719,7 @@ class UC480Camera(AjustesMixin):
         if clave == "fps":
             self.set_fps(float(v))
         elif clave == "exposicion":
-            self.set_exposure(float(v))
+            self.pedir_exposicion(float(v))
         elif clave == "exp_auto":
             self._auto(IS_SET_ENABLE_AUTO_SHUTTER, v)
         elif clave == "exp_larga":
@@ -1594,12 +1845,14 @@ class UC480Camera(AjustesMixin):
         return int(clk.value)
 
     def set_pixel_clock(self, mhz: int) -> int:
+        self._parar_continuo()
         self._check(self.dll.is_PixelClock(self.h, IS_PIXELCLOCK_CMD_SET,
                                            C.byref(C.c_uint(mhz)), 4), "is_PixelClock")
         self.pixel_clock = self.get_pixel_clock()
         return self.pixel_clock
 
     def set_fps(self, fps: float) -> float:
+        self._parar_continuo()
         got = C.c_double()
         self.dll.is_SetFrameRate(self.h, C.c_double(fps or 1000.0), C.byref(got))
         self.fps = got.value
@@ -1633,6 +1886,7 @@ class UC480Camera(AjustesMixin):
         return lo.value, hi.value
 
     def set_exposure(self, ms: float) -> float:
+        self._parar_continuo()
         lo, hi = self.exposure_range()
         val = C.c_double(min(max(ms, lo), hi))
         self._check(self.dll.is_Exposure(self.h, IS_EXPOSURE_CMD_SET, C.byref(val), 8),
@@ -1642,25 +1896,144 @@ class UC480Camera(AjustesMixin):
         self.exposure_ms = got.value
         return self.exposure_ms
 
+    def pedir_exposicion(self, ms: float) -> float:
+        """Fija la exposicion haciendole lugar: baja cuadros y reloj si no entra.
+
+        set_exposure recorta al cuadro actual, y con los cuadros al maximo eso son
+        72 ms en la C1280R12C: pedir 600 daba 72 sin avisar y la imagen quedaba negra.
+        Al volver a una exposicion corta se recuperan el reloj y los cuadros de antes.
+        """
+        base = self._tiempos_base
+        if base is None:
+            hi = self.exposure_range()[1]
+            if ms <= hi:
+                return self.set_exposure(ms)
+            base = self._tiempos_base = (self.pixel_clock, self.fps, hi, self._cuadro_max_ms())
+        clk, fps, hi, cuadro = base
+        if ms <= hi:
+            self._tiempos_base = None
+            self.set_pixel_clock(clk)
+            self.set_fps(fps)
+            return self.set_exposure(ms)
+        reloj = self.cap.get("reloj")
+        destino = reloj_para_exposicion(ms, clk, cuadro, reloj[0]) if reloj and cuadro else clk
+        if destino != self.pixel_clock:
+            self.set_pixel_clock(destino)
+        self.set_fps(1000.0 / (ms * 1.005))
+        if self.exposure_range()[1] < ms:
+            self.set_fps(0.001)     # el SDK lo sube al minimo que admite este reloj
+        return self.set_exposure(ms)
+
+    # --- video continuo ---
+    # is_FreezeVideo toma una foto por llamada: expone, transfiere y recien despues
+    # se puede pedir la siguiente. Con la C1280R12C a 24 MHz eso daba 7 cuadros/s
+    # contra 14 en continuo, y 25 a 43 MHz. En continuo la camara transmite sola
+    # sobre una cola de buffers y grab() toma el mas reciente.
+
+    def _iniciar_continuo(self) -> None:
+        d, h = self.dll, self.h
+        self._buffers = []
+        try:
+            for _ in range(BUFFERS_VIVO):
+                m, i = C.c_char_p(), C.c_int()
+                self._check(d.is_AllocImageMem(h, self.width, self.height, self.bpp,
+                                               C.byref(m), C.byref(i)), "is_AllocImageMem")
+                self._buffers.append((m, i))
+                self._check(d.is_AddToSequence(h, m, i), "is_AddToSequence")
+            self._check(d.is_InitImageQueue(h, 0), "is_InitImageQueue")
+            self._check(d.is_CaptureVideo(h, IS_DONT_WAIT), "is_CaptureVideo")
+        except UC480Error:
+            self._vivo = True           # para que _parar_continuo limpie todo
+            self._parar_continuo()
+            raise
+        self._vivo = True
+
+    def _parar_continuo(self) -> None:
+        """Detiene el video y deja la camara lista para is_FreezeVideo.
+
+        Se llama antes de cualquier cambio de ajuste: los cuadros que ya estaban
+        en camino se expusieron con los valores viejos, y reiniciar los descarta.
+        """
+        if not getattr(self, "_vivo", False):
+            return
+        d, h = self.dll, self.h
+        d.is_StopLiveVideo(h, IS_FORCE_VIDEO_STOP)
+        d.is_ExitImageQueue(h)
+        d.is_ClearSequence(h)
+        for m, i in self._buffers:
+            d.is_FreeImageMem(h, m, i)
+        self._buffers = []
+        self._vivo = False
+        if getattr(self, "mem", None):
+            d.is_SetImageMem(h, self.mem, self.mem_id)
+
+    def _esperar_cuadro(self) -> tuple[C.c_void_p, C.c_int]:
+        """El proximo cuadro de la cola, en tramos cortos para que Detener responda."""
+        d, h = self.dll, self.h
+        pm, pid = C.c_void_p(), C.c_int()
+        rc = IS_TIMED_OUT
+        for _ in range(self.cfg.retries + 1):
+            limite = time.monotonic() + espera_de_cuadro_ms(self.exposure_ms, self.fps) / 1000
+            while True:
+                if self._cancelar.is_set():
+                    raise CapturaCancelada("captura cancelada")
+                resta = int((limite - time.monotonic()) * 1000)
+                rc = d.is_WaitForNextImage(h, max(1, min(TRAMO_ESPERA_MS, resta)),
+                                           C.byref(pm), C.byref(pid))
+                if rc == IS_SUCCESS:
+                    return pm, pid
+                if rc != IS_TIMED_OUT or resta <= TRAMO_ESPERA_MS:
+                    break
+            self.transfer_errors += 1
+        self._parar_continuo()          # el proximo intento arranca limpio
+        raise UC480Error(f"is_WaitForNextImage devolvio rc={rc}")
+
+    def _grab_continuo(self) -> bytes:
+        d, h = self.dll, self.h
+        descartar = 0
+        if not getattr(self, "_vivo", False):
+            self._iniciar_continuo()
+            descartar = DESCARTE_AL_ARRANCAR
+        pm, pid = self._esperar_cuadro()
+        for _ in range(descartar):
+            d.is_UnlockSeqBuf(h, pid, pm)
+            pm, pid = self._esperar_cuadro()
+        # Si se juntaron varios, sirve el ultimo: uno viejo es una imagen atrasada.
+        while True:
+            pm2, pid2 = C.c_void_p(), C.c_int()
+            if d.is_WaitForNextImage(h, 0, C.byref(pm2), C.byref(pid2)) != IS_SUCCESS:
+                break
+            d.is_UnlockSeqBuf(h, pid, pm)
+            pm, pid = pm2, pid2
+        try:
+            return C.string_at(pm.value, self.pitch * self.height)
+        finally:
+            d.is_UnlockSeqBuf(h, pid, pm)
+
     def grab(self) -> np.ndarray:
         """Captura un frame completo.
 
-        is_FreezeVideo bloquea hasta tener la imagen entera, asi que no hay
-        riesgo de leer un buffer a medio escribir. Sobre USB 2.0 falla de forma
-        intermitente con IS_TRANSFER_ERROR; de ahi los reintentos.
+        Con trigger libre, del video continuo. Con trigger externo o por software,
+        is_FreezeVideo, que bloquea hasta tener la imagen entera. Sobre USB 2.0 la
+        transferencia falla de forma intermitente; de ahi los reintentos.
         """
-        if self.valores["trigger_modo"].startswith("flanco"):
-            self._grab_con_trigger()
+        modo = self.valores["trigger_modo"]
+        if modo == "libre":
+            raw = self._grab_continuo()
         else:
-            rc = IS_TRANSFER_ERROR
-            for _ in range(self.cfg.retries + 1):
-                rc = self.dll.is_FreezeVideo(self.h, IS_WAIT)
-                if rc == IS_SUCCESS:
-                    break
-                self.transfer_errors += 1
-            self._check(rc, "is_FreezeVideo")
+            self._parar_continuo()
+            if modo.startswith("flanco"):
+                self._grab_con_trigger()
+            else:
+                rc = IS_TRANSFER_ERROR
+                for _ in range(self.cfg.retries + 1):
+                    rc = self.dll.is_FreezeVideo(self.h, IS_WAIT)
+                    if rc == IS_SUCCESS:
+                        break
+                    self.transfer_errors += 1
+                self._check(rc, "is_FreezeVideo")
+            raw = C.string_at(self.mem, self.pitch * self.height)
 
-        raw = C.string_at(self.mem, self.pitch * self.height)
         arr = np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.pitch)
         arr = arr[:, : self.width * self.channels]
         arr = arr.reshape(self.height, self.width, self.channels)
@@ -1669,6 +2042,7 @@ class UC480Camera(AjustesMixin):
     def close(self) -> None:
         global _camaras_abiertas
         if getattr(self, "h", None) and self.h.value:
+            self._parar_continuo()
             if getattr(self, "mem", None):
                 self.dll.is_FreeImageMem(self.h, self.mem, self.mem_id)
             self.dll.is_ExitCamera(self.h)
@@ -1701,6 +2075,7 @@ class DemoCamera(AjustesMixin):
 
     def __init__(self, cfg: Config):
         self.cfg, self.exposure_ms, self._t = cfg, cfg.exposure_ms, 0
+        self._cancelar = threading.Event()
         self.width, self.full_height = 640, 480
         self.full_width = self.width
         self.height = self.full_height // cfg.binning
@@ -1730,8 +2105,11 @@ class DemoCamera(AjustesMixin):
         img = np.stack([base * 0.9, base, base * 0.75], axis=2)
         ruido = np.random.default_rng(self._t).normal(0, 1.5, img.shape)
         ganancia = 1.0 + float(self.valores["ganancia"]) / 100.0 * 3.0
+        # BGR, como la camara. Cada canal escala con su ganancia, sin tocar el ruido base.
+        por_canal = [factor_de_ganancia(self.valores[c])
+                     for c in ("ganancia_b", "ganancia_g", "ganancia_r")]
         img = (img * (self.exposure_ms / 20.0) * factor_de_opcion(self.valores["bin_v"])
-               * ganancia + ruido)
+               * ganancia * np.array(por_canal) + ruido + float(self.valores["negro"]))
         gamma = float(self.valores["gamma"])
         if gamma != 1.0:
             img = 255.0 * (np.clip(img, 0, 255) / 255.0) ** (1.0 / gamma)
@@ -1763,14 +2141,19 @@ class DemoCamera(AjustesMixin):
         self.fps = fps or self.cap["fps"][1]
         return self.fps
 
-    def cancelar(self) -> None: ...
+    def cancelar(self) -> None:
+        self._cancelar.set()
 
-    def reanudar(self) -> None: ...
+    def reanudar(self) -> None:
+        self._cancelar.clear()
 
     def set_exposure(self, ms: float) -> float:
         lo, hi = self.exposure_range()
         self.exposure_ms = min(max(ms, lo), hi)
         return self.exposure_ms
+
+    def pedir_exposicion(self, ms: float) -> float:
+        return self.set_exposure(ms)     # sin reloj que bajar: el rango es fijo
 
     def exposure_range(self) -> tuple[float, float]:
         return 0.01, 500.0
@@ -1833,11 +2216,52 @@ def capture_dark(cam: Camera, n: int = 32, progress=None) -> np.ndarray:
     return acc / got
 
 
-def apply_dark(frame: np.ndarray, dark: np.ndarray | None) -> np.ndarray:
-    """Resta el dark y recorta en cero. Si no coincide la forma, no hace nada."""
+def apply_dark(frame: np.ndarray, dark: np.ndarray | None,
+               en_sitio: bool = False) -> np.ndarray:
+    """Resta el dark y recorta en cero. Si no coincide la forma, no hace nada.
+
+    en_sitio reescribe frame, que tiene que ser float64 y no estar compartido: un
+    cuadro completo son 31 MB y reservar uno nuevo cuesta mas que la resta.
+    """
     if dark is None or dark.shape != frame.shape:
         return frame
+    if en_sitio and frame.dtype == np.float64:
+        np.subtract(frame, dark, out=frame)
+        return np.maximum(frame, 0, out=frame)
     return np.clip(frame.astype(np.float64) - dark, 0, None)
+
+
+class Promedio:
+    """Promedia cuadros a medida que llegan, sumando sobre un solo arreglo.
+
+    np.mean sobre una lista apila todos los cuadros en un arreglo nuevo antes de
+    promediar: con 1280x1024 en color eran 33 ms por cuadro aun promediando uno.
+    Cada promedio arranca en un arreglo propio, porque el anterior ya se entrego a
+    la pantalla o a un guardado y no se puede reescribir. Si el tamaño cambia a
+    mitad de camino (binning, AOI), se descarta lo sumado: mezclar no tiene sentido.
+    """
+
+    def __init__(self) -> None:
+        self.suma: np.ndarray | None = None
+        self.n = 0
+
+    def agregar(self, cuadro: np.ndarray) -> None:
+        if self.suma is None or self.suma.shape != cuadro.shape:
+            self.suma, self.n = cuadro.astype(np.float64), 1
+        else:
+            np.add(self.suma, cuadro, out=self.suma)
+            self.n += 1
+
+    def resultado(self) -> np.ndarray | None:
+        """El promedio en float64 BGR (un mono se repite en los tres canales)."""
+        if self.suma is None:
+            return None
+        f = self.suma
+        if self.n > 1:
+            f /= self.n
+        if f.ndim == 2:
+            f = np.repeat(f[:, :, None], 3, axis=2)
+        return f
 
 
 def load_dark(path: Path) -> np.ndarray | None:
@@ -1997,9 +2421,9 @@ def run_viewer(cam: Camera, cfg: Config, dark: np.ndarray | None = None) -> None
             if k in (ord("q"), 27) or cerrada():
                 break
             elif k in (ord("+"), ord("=")):
-                state["exp"] = cam.set_exposure(state["exp"] * 1.25)
+                state["exp"] = cam.pedir_exposicion(state["exp"] * 1.25)
             elif k == ord("-"):
-                state["exp"] = cam.set_exposure(state["exp"] / 1.25)
+                state["exp"] = cam.pedir_exposicion(state["exp"] / 1.25)
             elif k == ord("]"):
                 state["radius"] = min(state["radius"] + 1, 64)
             elif k == ord("["):
@@ -2014,7 +2438,7 @@ def run_viewer(cam: Camera, cfg: Config, dark: np.ndarray | None = None) -> None
                       f"(+ {tiff_path.name}, floats sin cuantizar)")
             elif k == ord("r"):
                 state.update(radius=cfg.roi_radius, avg=cfg.average, pinned=False)
-                state["exp"] = cam.set_exposure(cfg.exposure_ms)
+                state["exp"] = cam.pedir_exposicion(cfg.exposure_ms)
             elif k == ord("s"):
                 if writer is None:
                     nuevo = not cfg.csv_path.exists()
@@ -2210,6 +2634,43 @@ def _ppm(rgb: np.ndarray) -> bytes:
     """
     h, w = rgb.shape[:2]
     return b"P6\n%d %d\n255\n" % (w, h) + np.ascontiguousarray(rgb).tobytes()
+
+
+def espera_hasta_proximo(inicio: float, ahora: float, intervalo_ms: int) -> int:
+    """Lo que falta para cumplir el intervalo, descontando lo que ya tardo el dibujo.
+
+    Con una espera fija despues de dibujar, el ciclo duraba intervalo + dibujo: 33 ms
+    mas unos 30 ms de dibujo daban 15 cuadros por segundo en pantalla en vez de 30.
+    Nunca 0, para que Tk atienda clicks y teclas entre dos dibujos.
+    """
+    return max(1, intervalo_ms - round((ahora - inicio) * 1000))
+
+
+def imagen_de_pantalla(f: np.ndarray, realzar: bool) -> tuple[np.ndarray, float]:
+    """El frame como uint8 para dibujar, y el factor aplicado.
+
+    Solo es para mirar: lecturas, guardados y Stokes usan el frame original. Se quita
+    el piso de cada canal y se aplica un mismo factor a todos, asi la imagen sigue
+    siendo proporcional a la señal y no cambia la relacion de color. El tope evita
+    convertir el ruido en imagen cuando no entra luz.
+    """
+    if not realzar:
+        return np.clip(f, 0, 255).astype(np.uint8), 1.0
+    muestra = f[::4, ::4]
+    piso, alto = np.percentile(muestra, [REALCE_PISO, AUTOLUZ_PERCENTIL], axis=(0, 1))
+    if alto.max() >= 254.5:
+        # Ya llega al tope: no hay nada que realzar. Restar el piso de una imagen
+        # saturada la pintaba negra mientras la lectura decia 255 (SAT 100%).
+        return np.clip(f, 0, 255).astype(np.uint8), 1.0
+    rango = float((alto - piso).max())
+    k = min(255.0 / max(rango, 1e-6), REALCE_MAX)
+    # En float32 y sobre el mismo arreglo: es una imagen para mirar, y en float64
+    # con copias costaba casi 10 ms por redibujo.
+    x = np.asarray(f, dtype=np.float32).copy()
+    x -= piso.astype(np.float32)
+    x *= np.float32(k)
+    np.clip(x, 0, 255, out=x)
+    return x.astype(np.uint8), k
 
 
 def perfil_horizontal(frame: np.ndarray, y: int) -> np.ndarray:
@@ -2478,6 +2939,16 @@ def abrir_ajustes(root, app) -> None:
     app.win_ajustes = VentanaAjustes(root, app)
 
 
+def pedir_autoluz(app) -> None:
+    """Pide el autoajuste al hilo de captura: mide, asi que necesita el visor corriendo."""
+    if app.cam is None:
+        return
+    # Con exposiciones largas tarda varios segundos con la imagen quieta.
+    app.lbl_aviso.config(text="Autoajustando: la imagen se detiene unos segundos...")
+    app.iniciar()
+    app.cola.pedir(ColaAjustes.AUTOLUZ)
+
+
 def procesar_ajustes(app) -> None:
     """En cada cuadro de la GUI: aplica si la captura esta detenida y muestra el resultado."""
     if app.cam is not None and not app.corriendo.is_set():
@@ -2513,9 +2984,13 @@ class CamaraGUI:
 
         self.tk, self.ttk = tk, ttk
         self.root, self.cfg = root, cfg
+        self.cfg_inicial = cfg      # self.cfg sigue a la camara: no dice que se pidio al abrir
+        self.realce_on = True
         self.cam: Camera | None = None
         self.dark = load_dark(cfg.dark_path)
         self.frame: np.ndarray | None = None
+        self.version_frame = 0      # sube con cada cuadro nuevo, bajo self.lock
+        self._ultima_vista: tuple | None = None
         self.lock = threading.Lock()
         self.hilo: threading.Thread | None = None
         self.corriendo = threading.Event()
@@ -2614,7 +3089,8 @@ class CamaraGUI:
         # es el parametro que uno busca a tientas hasta que la señal entra en
         # escala, y con el visor corriendo se ve el efecto al instante.
         n = len(campos)
-        self.slider_exp = ttk.Scale(f, orient="horizontal", from_=0.1, to=100.0,
+        # Escala logaritmica: el rango va de decimas de ms a casi un segundo.
+        self.slider_exp = ttk.Scale(f, orient="horizontal", from_=-1.0, to=2.0,
                                     command=self._mover_exposicion)
         self.slider_exp.grid(row=n, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.lbl_exp = ttk.Label(f, text="exposicion en vivo", font=("Consolas", 8),
@@ -2622,6 +3098,9 @@ class CamaraGUI:
         self.lbl_exp.grid(row=n + 1, column=0, columnspan=2, sticky="w")
         ttk.Button(f, text="Aplicar", command=self.aplicar).grid(
             row=n + 2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(f, text="Autoajustar luz", style="Neon.TButton",
+                   command=lambda: pedir_autoluz(self)).grid(
+            row=n + 3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         f = ttk.LabelFrame(izq, text="Visor en vivo", padding=6)
         f.pack(fill="x", pady=(6, 0))
@@ -2636,6 +3115,10 @@ class CamaraGUI:
         self.chk_dark = ttk.Checkbutton(f, text="Restar dark frame",
                                         variable=self.var_dark, command=self._cambiar_dark)
         self.chk_dark.pack(anchor="w", pady=(6, 0))
+        self.var_realce = tk.BooleanVar(value=self.realce_on)
+        self.chk_realce = ttk.Checkbutton(f, text="Realzar en pantalla",
+                                          variable=self.var_realce, command=self._cambiar_realce)
+        self.chk_realce.pack(anchor="w", pady=(2, 0))
         fila = ttk.Frame(f)
         fila.pack(fill="x", pady=(4, 0))
         ttk.Button(fila, text="Capturar dark", command=self.capturar_dark).pack(
@@ -2735,9 +3218,18 @@ class CamaraGUI:
     def _abrir_camara_real(self) -> None:
         """Detecta y abre la camara, y refresca la ficha. Propaga UC480Error."""
         self.cam = open_camera(self.cfg)
+        self.realce_on, aviso = restaurar_ultimos(self.cam, self.cfg_inicial)
+        self.var_realce.set(self.realce_on)
+        v = self.cam.valores
+        self.cfg = replace(self.cfg, gain=int(v["ganancia"]), exposure_ms=self.cam.exposure_ms,
+                           binning=min(factor_de_opcion(v["bin_v"]), max(BINNING_MODES)))
+        self.var_gain.set(self.cfg.gain)
+        self.var_bin.set(self.cfg.binning)
         self.pos = (self.cam.width // 2, self.cam.height // 2)
         self.root.title(f"Camara - {self.cam.marca} {self.cam.model}")
         self._actualizar_ficha()
+        if aviso and not self.lbl_aviso.cget("text"):
+            self.lbl_aviso.config(text=aviso)
         self.var_exp.set(f"{self.cam.exposure_ms:g}")
         self._rango_exposicion()
 
@@ -2746,7 +3238,9 @@ class CamaraGUI:
         self.lbl_cam.config(
             text=f"{ficha_camara(cam)}\n{cam.width}x{cam.height}   "
                  f"exp {cam.exposure_ms:.2f} ms\n"
-                 f"clk {getattr(cam, 'pixel_clock', 0)} MHz   {cam.fps:.1f} fps",
+                 f"clk {getattr(cam, 'pixel_clock', 0)} MHz   {cam.fps:.1f} fps   "
+                 f"{texto_negro(cam)}\n"
+                 f"ganancia {texto_ganancias(cam)}",
             foreground=CYBER["neon2"] if self.cfg.demo else CYBER["ok"])
         # Lo que esta camara no tiene no se ofrece: la uEye C1280R12C no tiene
         # binning ni ganancia master.
@@ -2761,9 +3255,17 @@ class CamaraGUI:
         """El hilo de captura aplico un ajuste: se sincroniza el resto de la ventana."""
         if self.cam is None:
             return
+        guardar_ultimos(self.cam, self.realce_on)
         self._actualizar_ficha()
-        if isinstance(res, Exception):
+        if isinstance(res, Exception) or clave == ColaAjustes.AUTOLUZ:
             self.lbl_aviso.config(text=str(res))
+        if clave == ColaAjustes.AUTOLUZ and isinstance(res, str) and self.dark_on \
+                and self.cam.luz_cambio:
+            # Restar un dark de otros ajustes falsearia todas las lecturas.
+            self.dark_on = False
+            self.var_dark.set(False)
+            self.lbl_aviso.config(text=f"{res} Dark frame desactivado: ya no corresponde, "
+                                       "captura otro con la tapa puesta.")
         v = self.cam.valores
         self.cfg = replace(self.cfg, gain=int(v["ganancia"]), exposure_ms=self.cam.exposure_ms,
                            binning=min(factor_de_opcion(v["bin_v"]), max(BINNING_MODES)))
@@ -2789,8 +3291,16 @@ class CamaraGUI:
             self.cfg = replace(self.cfg, demo=True)
             self._abrir_camara_real()
 
+    def _cambiar_realce(self) -> None:
+        self.realce_on = bool(self.var_realce.get())
+        if not self.realce_on:
+            self.chk_realce.config(text="Realzar en pantalla")
+        if self.cam is not None:
+            guardar_ultimos(self.cam, self.realce_on)
+
     def _cerrar_camara(self) -> None:
         if self.cam is not None:
+            guardar_ultimos(self.cam, self.realce_on)
             self.cam.close()
             self.cam = None
 
@@ -2878,12 +3388,12 @@ class CamaraGUI:
             if cam is None:
                 return
             self.cola.drenar(cam)
-            pila = []
+            prom = Promedio()
             for _ in range(cfg.average):
                 if not self.corriendo.is_set():
                     return
                 try:
-                    pila.append(cam.grab().astype(np.float64))
+                    prom.agregar(cam.grab())
                     self.sin_trigger = False
                 except CapturaCancelada:
                     return
@@ -2894,24 +3404,36 @@ class CamaraGUI:
                 except UC480Error:
                     self.perdidos += 1
                 self.totales += 1
-            if not pila:
+            f = prom.resultado()
+            if f is None:
                 continue
-            f = np.mean(pila, axis=0)
-            if f.ndim == 2:
-                f = np.repeat(f[:, :, None], 3, axis=2)
             if self.dark_on:
-                f = apply_dark(f, self.dark)
+                f = apply_dark(f, self.dark, en_sitio=True)
             with self.lock:
                 self.frame = f
+                self.version_frame += 1
+
+    def _clave_vista(self) -> tuple:
+        """Todo lo que cambia el dibujo ademas del cuadro. Leerlo es barato."""
+        return (self.version_frame, self.canvas.winfo_width(), self.canvas.winfo_height(),
+                self.pos, self.fijado, self.perfil_pos, self.perfil_h_on, self.perfil_v_on,
+                self.realce_on, self.dark_on, self.cfg.roi_radius, self.cfg.decimals,
+                self.cfg.normalize, self.cfg.sat_level)
 
     def _tick(self) -> None:
+        t0 = time.perf_counter()
         with self.lock:
             f = self.frame
-        if f is not None:
+        # Redibujar sin cuadro nuevo ni cambio de vista era trabajo tirado, y le
+        # quitaba procesador al hilo de captura.
+        clave = self._clave_vista()
+        if f is not None and clave != self._ultima_vista:
+            self._ultima_vista = clave
             self._dibujar(f)
         procesar_ajustes(self)
         self._refrescar_estado()
-        self.root.after(self.INTERVALO_MS, self._tick)
+        self.root.after(espera_hasta_proximo(t0, time.perf_counter(), self.INTERVALO_MS),
+                        self._tick)
 
     def _dibujar(self, f: np.ndarray) -> None:
         import cv2
@@ -2929,8 +3451,12 @@ class CamaraGUI:
         s = sample_patch(f, x, y, self.cfg.roi_radius, self.cfg.sat_level)
         self.ultima = s
 
-        disp = cv2.resize(np.clip(f, 0, 255).astype(np.uint8), (dw, dh),
-                          interpolation=cv2.INTER_AREA)
+        # Se reduce primero: convertir el cuadro completo costaba 8 ms por redibujo.
+        disp, realce = imagen_de_pantalla(
+            cv2.resize(f, (dw, dh), interpolation=cv2.INTER_AREA), self.realce_on)
+        texto = f"Realzar en pantalla  x{realce:.1f}"
+        if self.realce_on and self.chk_realce.cget("text") != texto:
+            self.chk_realce.config(text=texto)
 
         # Rectas de los perfiles, en la posicion del ultimo click.
         px, py = self.perfil_pos if self.perfil_pos is not None else (w // 2, h // 2)
@@ -2960,11 +3486,14 @@ class CamaraGUI:
         else:
             self.canvas.itemconfigure(self._img_id, image=self.photo)
             self.canvas.coords(self._img_id, ox, oy)
-        recortados = canales_recortados(s) if self.dark_on is False else []
+        # Al limite el consejo ya no sirve, y con luz de un color un canal en 0 es normal.
+        recortados = (canales_recortados(s)
+                      if self.dark_on is False and queda_margen_de_luz(self.cam) else [])
         self.lbl_lectura.config(
             text="\n".join(format_sample(s, self.cfg.decimals, self.cfg.normalize))
                  + ("\n[FIJADO] click para soltar" if self.fijado else "")
-                 + (f"\n{'/'.join(recortados)} en 0: sube el nivel de negro" if recortados else ""))
+                 + (f"\n{'/'.join(recortados)} en 0: falta luz, usa Autoajustar luz"
+                    if recortados else ""))
 
     def _refrescar_estado(self) -> None:
         vivo = self.corriendo.is_set()
@@ -3020,7 +3549,7 @@ class CamaraGUI:
     def _mover_exposicion(self, valor: str) -> None:
         if self._ajustando:
             return
-        ms = float(valor)
+        ms = 10.0 ** float(valor)
         self.lbl_exp.config(text=f"exposicion {ms:.2f} ms")
         self.var_exp.set(f"{ms:g}")
         self.cola.pedir("exposicion", ms)    # lo aplica el hilo entre frames
@@ -3034,8 +3563,8 @@ class CamaraGUI:
         lo, hi = rango.minimo, rango.maximo
         self._ajustando = True
         try:
-            self.slider_exp.config(from_=lo, to=hi)
-            self.slider_exp.set(self.cam.exposure_ms)
+            self.slider_exp.config(from_=float(np.log10(lo)), to=float(np.log10(hi)))
+            self.slider_exp.set(float(np.log10(self.cam.exposure_ms)))
         finally:
             self._ajustando = False
         self.lbl_exp.config(text=f"exposicion {self.cam.exposure_ms:.2f} ms "
@@ -3652,6 +4181,162 @@ def test_dark_se_resta_y_recorta_en_cero():
     assert apply_dark(frame, _flat(20, w=8)).max() == 30.0  # forma distinta, ignora
 
 
+def test_dark_en_sitio_da_lo_mismo_sin_copiar():
+    rng = np.random.default_rng(3)
+    frame = rng.uniform(0, 60, (6, 8, 3))
+    dark = rng.uniform(0, 40, (6, 8, 3))
+    esperado = apply_dark(frame, dark)
+    copia = frame.copy()
+    res = apply_dark(copia, dark, en_sitio=True)
+    assert res is copia and np.array_equal(res, esperado)
+    assert res.min() == 0.0
+
+
+def test_promedio_iguala_a_np_mean_y_respeta_lo_ya_entregado():
+    rng = np.random.default_rng(4)
+    cuadros = [rng.integers(0, 256, (5, 7, 3), dtype=np.uint8) for _ in range(4)]
+    p = Promedio()
+    for c in cuadros:
+        p.agregar(c)
+    f = p.resultado()
+    assert f.dtype == np.float64 and np.allclose(f, np.mean(cuadros, axis=0))
+    # Un promedio nuevo no reescribe el que ya se entrego.
+    q = Promedio()
+    q.agregar(cuadros[0])
+    assert np.allclose(f, np.mean(cuadros, axis=0))
+    assert not np.shares_memory(f, q.resultado())
+
+
+def test_promedio_descarta_lo_sumado_si_cambia_el_tamano():
+    p = Promedio()
+    p.agregar(np.full((4, 4, 3), 10, np.uint8))
+    p.agregar(np.full((2, 4, 3), 50, np.uint8))     # cambio de binning a mitad
+    f = p.resultado()
+    assert f.shape == (2, 4, 3) and p.n == 1 and f.max() == 50.0
+
+
+class _DllVivoFalsa:
+    """Lo minimo del SDK para el video continuo: una cola de cuadros de 2x2 BGR."""
+
+    def __init__(self):
+        self.llamadas, self.cola, self.liberados = [], [], []
+        self.pendientes = []        # cuadros que llegan mientras se espera
+        self._bufs = {}
+
+    def is_AllocImageMem(self, h, w, alto, bpp, pmem, pid):
+        buf = C.create_string_buffer(w * alto * bpp // 8)
+        pid._obj.value = len(self._bufs) + 1
+        self._bufs[pid._obj.value] = buf
+        pmem._obj.value = C.addressof(buf)
+        return IS_SUCCESS
+
+    def poner(self, valor: int) -> None:
+        """Deja un cuadro listo en la cola, lleno con valor."""
+        i = len(self.cola) % BUFFERS_VIVO + 1
+        C.memset(self._bufs[i], valor, len(self._bufs[i]))
+        self.cola.append(i)
+
+    def is_WaitForNextImage(self, h, espera, pm, pid):
+        self.llamadas.append("Wait")
+        if not self.cola and self.pendientes and espera > 0:
+            self.poner(self.pendientes.pop(0))
+        if not self.cola:
+            return IS_TIMED_OUT
+        i = self.cola.pop(0)
+        pm._obj.value, pid._obj.value = C.addressof(self._bufs[i]), i
+        return IS_SUCCESS
+
+    def is_UnlockSeqBuf(self, h, pid, pm):
+        self.liberados.append(pid.value)
+        return IS_SUCCESS
+
+    def __getattr__(self, nombre):
+        def llamada(*_a):
+            self.llamadas.append(nombre.replace("is_", ""))
+            return IS_SUCCESS
+        return llamada
+
+
+def _camara_vivo_falsa():
+    cam = UC480Camera.__new__(UC480Camera)
+    cam.dll, cam.h = _DllVivoFalsa(), C.c_uint32(1)
+    cam.cfg = Config(retries=1)
+    cam.width = cam.height = 2
+    cam.bpp, cam.channels, cam.pitch = 24, 3, 6
+    cam._buf_foto = C.create_string_buffer(12)     # el buffer de is_FreezeVideo
+    cam.mem, cam.mem_id = C.cast(cam._buf_foto, C.c_char_p), C.c_int(9)
+    cam.valores = {"trigger_modo": "libre"}
+    cam._cancelar = threading.Event()
+    cam.transfer_errors, cam.exposure_ms, cam.fps = 0, 1.0, 1000.0
+    return cam
+
+
+def test_el_video_continuo_entrega_el_cuadro_mas_reciente():
+    cam = _camara_vivo_falsa()
+    cam.dll.is_CaptureVideo = lambda h, modo: cam.dll.llamadas.append("Capture") or [
+        cam.dll.poner(v) for v in (10, 20, 30)] and IS_SUCCESS
+    f = cam.grab()
+    assert cam.dll.llamadas.count("Capture") == 1 and f.shape == (2, 2, 3)
+    assert f.max() == 30                    # el ultimo, no el primero de la cola
+    assert sorted(cam.dll.liberados) == [1, 2, 3]   # todos vuelven a la cola
+    cam.dll.poner(40)
+    assert cam.grab().max() == 40 and cam.dll.llamadas.count("Capture") == 1
+
+
+def test_tras_arrancar_se_descarta_el_cuadro_con_el_ajuste_viejo():
+    cam = _camara_vivo_falsa()
+    cam.dll.is_CaptureVideo = lambda h, modo: cam.dll.poner(65) or IS_SUCCESS
+    cam.dll.pendientes = [6]                # el segundo cuadro ya trae el valor nuevo
+    assert cam.grab().max() == 6
+
+
+def test_un_cambio_de_ajuste_reinicia_el_video():
+    cam = _camara_vivo_falsa()
+    cam.dll.is_CaptureVideo = lambda h, modo: [cam.dll.poner(5), cam.dll.poner(6)] and IS_SUCCESS
+    cam.grab()
+    cam.set_fps(10.0)                       # cualquier ajuste: los cuadros en camino son viejos
+    assert "StopLiveVideo" in cam.dll.llamadas and "SetImageMem" in cam.dll.llamadas
+    assert not cam._vivo
+    cam.grab()
+    assert cam._vivo
+
+
+def test_con_trigger_externo_vuelve_a_foto_a_foto():
+    cam = _camara_vivo_falsa()
+    cam.dll.is_CaptureVideo = lambda h, modo: [cam.dll.poner(5), cam.dll.poner(6)] and IS_SUCCESS
+    cam.grab()
+    cam.valores["trigger_modo"] = "software"
+    cam.grab()
+    assert not cam._vivo and "FreezeVideo" in cam.dll.llamadas
+
+
+def test_sin_cuadros_el_video_continuo_falla_y_queda_listo_para_reintentar():
+    import pytest
+    cam = _camara_vivo_falsa()                  # la cola nunca recibe nada
+    with pytest.raises(UC480Error, match="WaitForNextImage"):
+        cam.grab()
+    assert cam.transfer_errors == 2 and not cam._vivo
+
+
+def test_la_espera_de_cuadro_cubre_exposiciones_largas():
+    assert espera_de_cuadro_ms(10.0, 25.0) == 2 * 40 + 500
+    assert espera_de_cuadro_ms(893.0, 1.1) == int(2 * (1000 / 1.1) + 500)
+    assert espera_de_cuadro_ms(5.0, 0.0) == 2500
+
+
+def test_la_espera_descuenta_lo_que_tardo_el_dibujo():
+    assert espera_hasta_proximo(10.0, 10.010, 33) == 23
+    assert espera_hasta_proximo(10.0, 10.050, 33) == 1     # atrasado: igual cede a Tk
+    assert espera_hasta_proximo(10.0, 10.0, 33) == 33
+
+
+def test_promedio_mono_sale_en_tres_canales_y_vacio_es_none():
+    p = Promedio()
+    assert p.resultado() is None
+    p.agregar(np.full((3, 3), 7, np.uint8))
+    assert p.resultado().shape == (3, 3, 3)
+
+
 def test_save_frame_as_npy_conserva_los_decimales(tmp_path):
     frame = np.full((3, 3, 3), 10.0)
     frame[0, 0, 0] = 10.25  # valor no representable por un uint8
@@ -4057,6 +4742,314 @@ def test_resultados_de_instalacion_se_interpretan():
     assert "fallo (codigo 5)" in resumir_instalacion({"uc480": 259, "ueye": 5})
     assert "Reinicia" in resumir_instalacion({"uc480": 3010})
     assert "No se instalo" in resumir_instalacion({"uc480": 5, "ueye": 5})
+
+
+def test_el_reloj_baja_solo_lo_necesario_para_la_exposicion():
+    # Medido en la C1280R12C: cuadro maximo de 205 ms a 24 MHz.
+    assert reloj_para_exposicion(150.0, 24, 205.0, 5) == 24
+    assert reloj_para_exposicion(613.0, 24, 205.0, 5) == 7
+    assert reloj_para_exposicion(5000.0, 24, 205.0, 5) == 5     # no baja del minimo
+
+
+def test_plan_autoluz_prefiere_exposicion_y_luego_ganancia():
+    import pytest
+    # Sobra margen de exposicion: la ganancia no se toca.
+    assert plan_autoluz(20.0, 20.0, 0.1, 900.0, 7.0) == (200.0, 1.0)
+    # La exposicion llega al tope: el resto lo pone la ganancia.
+    exp, k = plan_autoluz(20.0, 450.0, 0.1, 900.0, 7.0)
+    assert exp == 900.0 and k == pytest.approx(5.0)
+    # La ganancia tampoco alcanza: se queda en lo que pueda.
+    assert plan_autoluz(5.0, 900.0, 0.1, 900.0, 3.0) == (900.0, 3.0)
+
+
+def test_plan_autoluz_termina_y_baja_si_satura():
+    assert plan_autoluz(AUTOLUZ_OBJETIVO, 20.0, 0.1, 900.0, 7.0) is None
+    assert plan_autoluz(255.0, 20.0, 0.1, 900.0, 7.0) == (10.0, 1.0)
+    # Sin nada que mover no hay paso: el autoajuste no gira en vano.
+    assert plan_autoluz(5.0, 900.0, 0.1, 900.0, 1.0) is None
+
+
+def test_el_pico_ignora_los_pixeles_calientes():
+    import pytest
+    img = _flat(40, 128, 128)
+    img[0, 0] = 255
+    assert pico_de_frame(img) == pytest.approx(40.0)
+
+
+def test_ganancia_y_factor_son_inversos_y_acotados():
+    for g in (0, 6, 50, 100):
+        assert ganancia_de_factor(factor_de_ganancia(g)) == g
+    assert ganancia_de_factor(100.0) == 100 and ganancia_de_factor(0.1) == 0
+
+
+def test_autoluz_lleva_la_imagen_a_escala_desde_oscuro_y_desde_saturado():
+    for exp in (0.3, 200.0):
+        cam = DemoCamera(Config(demo=True, exposure_ms=exp))
+        resumen = cam.autoajustar_luz()
+        assert AUTOLUZ_MINIMO <= pico_de_frame(cam.grab()) <= AUTOLUZ_SATURA
+        assert "Autoajuste" in resumen and "limite" not in resumen
+
+
+def test_autoluz_usa_la_ganancia_cuando_la_exposicion_no_alcanza(monkeypatch):
+    monkeypatch.setattr(DemoCamera, "exposure_range", lambda self: (0.01, 2.0))
+    cam = DemoCamera(Config(demo=True, exposure_ms=0.5))
+    cam.cap["exposicion"] = (0.01, 2.0, 0.01)
+    cam.autoajustar_luz()
+    assert cam.exposure_ms == 2.0
+    # Conserva el balance: las tres ganancias suben por igual.
+    assert cam.valores["ganancia_r"] == cam.valores["ganancia_g"] == cam.valores["ganancia_b"] > 0
+    assert AUTOLUZ_MINIMO <= pico_de_frame(cam.grab()) <= AUTOLUZ_SATURA
+
+
+def test_autoluz_se_rechaza_con_trigger_y_se_cancela():
+    import pytest
+    cam = DemoCamera(Config(demo=True))
+    cam.cancelar()
+    with pytest.raises(CapturaCancelada):
+        cam.autoajustar_luz()
+    cam.reanudar()
+    cam.valores["trigger_modo"] = "flanco de subida"
+    with pytest.raises(UC480Error, match="trigger"):
+        cam.autoajustar_luz()
+
+
+def test_la_cola_ejecuta_el_autoajuste_e_informa_el_resultado():
+    cam, cola = DemoCamera(Config(demo=True, exposure_ms=0.3)), ColaAjustes()
+    cola.pedir(ColaAjustes.AUTOLUZ)
+    assert cola.drenar(cam)
+    [(clave, res)] = cola.hechos()
+    assert clave == ColaAjustes.AUTOLUZ and "Autoajuste" in res and cam.exposure_ms > 0.3
+
+
+class _CamaraRelojFalsa:
+    """Las cuentas del sensor sobre un SDK falso: cuadro mas largo = 4920/reloj ms."""
+
+    pedir_exposicion = UC480Camera.pedir_exposicion
+
+    def __init__(self):
+        self.pixel_clock, self.fps, self._tiempos_base = 24, 13.96, None
+        self.cap = {"reloj": (5, 43, 1)}
+        self.exposure_ms = 20.0
+
+    def _cuadro_max_ms(self):
+        return 4920.0 / self.pixel_clock
+
+    def exposure_range(self):
+        return 0.1, min(1000.0 / self.fps, self._cuadro_max_ms()) - 0.2
+
+    def set_pixel_clock(self, mhz):
+        self.pixel_clock = mhz
+        self.fps = max(self.fps, 1000.0 / self._cuadro_max_ms())
+
+    def set_fps(self, fps):
+        self.fps = max(fps, 1000.0 / self._cuadro_max_ms())
+
+    def set_exposure(self, ms):
+        self.exposure_ms = min(ms, self.exposure_range()[1])
+        return self.exposure_ms
+
+
+def test_pedir_exposicion_baja_cuadros_y_reloj_y_los_recupera():
+    cam = _CamaraRelojFalsa()
+    assert cam.pedir_exposicion(30.0) == 30.0 and cam.pixel_clock == 24   # entra: nada cambia
+    assert cam.pedir_exposicion(150.0) == 150.0 and cam.pixel_clock == 24 # alcanza con los cuadros
+    assert cam.fps < 7.0
+    assert cam.pedir_exposicion(613.0) == 613.0 and cam.pixel_clock == 7  # hace falta el reloj
+    assert cam.pedir_exposicion(150.0) == 150.0 and cam.pixel_clock == 24 # se recupera el reloj
+    assert cam.pedir_exposicion(20.0) == 20.0
+    assert (cam.pixel_clock, cam.fps) == (24, 13.96) and cam._tiempos_base is None
+
+
+def test_pedir_exposicion_satura_en_el_tope_del_reloj_mas_lento():
+    import pytest
+    cam = _CamaraRelojFalsa()
+    assert cam.pedir_exposicion(5000.0) == pytest.approx(4920.0 / 5 - 0.2)
+    assert cam.pixel_clock == 5
+
+
+def test_realce_quita_el_piso_de_cada_canal_y_conserva_las_proporciones():
+    # Los anillos tenues: R entre 10 y 50, G plano en 6 (el piso del C1280R12C).
+    img = np.zeros((400, 400, 3))
+    img[:, :, 2] = np.linspace(10, 50, 400)
+    img[:, :, 1] = 6.0
+    disp, k = imagen_de_pantalla(img, True)
+    assert disp.dtype == np.uint8
+    assert k > 5
+    assert disp[:, :, 1].max() == 0                  # el piso plano no tiñe la imagen
+    assert disp[:, 399, 2].mean() > 240              # lo mas brillante llega arriba
+    # Es lineal: la mitad de la señal da la mitad en pantalla.
+    assert abs(float(disp[:, 200, 2].mean()) / float(disp[:, 399, 2].mean()) - 0.5) < 0.03
+
+
+def test_el_consejo_de_luz_solo_aparece_si_queda_margen():
+    cam = DemoCamera(Config(demo=True))
+    assert queda_margen_de_luz(cam)
+    cam.set_exposure(cam.cap["exposicion"][1])
+    assert queda_margen_de_luz(cam)                 # todavia quedan las ganancias
+    # Lo que dejo el autoajuste en la C1280R12C: el rojo al tope frena a las demas.
+    cam.valores.update(ganancia_r=100, ganancia_g=55, ganancia_b=100)
+    assert not queda_margen_de_luz(cam)
+
+
+class _CamaraConPisoBajoCero(DemoCamera):
+    """Como la C1280R12C: el piso queda bajo el ADC hasta subir el nivel de negro."""
+
+    PISO = 34.0
+
+    def grab(self):
+        img = np.full((64, 64, 3), 180.0) * (self.exposure_ms / 20.0)
+        img[20:] = 0.0                              # zona sin luz
+        img += self.valores["negro"] - self.PISO
+        return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def test_fraccion_recortada_toma_el_peor_canal():
+    img = _flat(10, 100, 100)
+    assert fraccion_recortada(img) == 0.0
+    img[:50, :, 0] = 0
+    assert fraccion_recortada(img) == 0.5
+    assert fraccion_recortada(img[:, :, 1]) == 0.0    # tambien en monocromo
+
+
+def test_plan_negro_sube_solo_con_recorte_y_respeta_el_tope():
+    assert plan_negro(0.0, 0) is None
+    assert plan_negro(NEGRO_RECORTE_MAX, 0) is None
+    assert plan_negro(0.5, 0) == NEGRO_PASO
+    assert plan_negro(0.5, NEGRO_MAX - 1) == NEGRO_MAX
+    assert plan_negro(0.5, NEGRO_MAX) is None
+
+
+def test_autoluz_sube_el_negro_hasta_quitar_el_recorte():
+    cam = _CamaraConPisoBajoCero(Config(demo=True))
+    resumen = cam.autoajustar_luz()
+    assert cam.valores["negro"] == 40               # el primer multiplo que supera el piso
+    assert fraccion_recortada(cam.grab()) == 0.0
+    assert "negro 40" in resumen and cam.luz_cambio
+    assert "recortado" not in resumen
+
+
+def test_autoluz_no_toca_el_negro_sin_recorte():
+    # La DCU224C tiene el piso en 25/19/13: no necesita ningun offset.
+    cam = DemoCamera(Config(demo=True))
+    cam.grab = lambda: _flat(200)
+    assert "negro 0" in cam.autoajustar_luz()
+    assert cam.valores["negro"] == 0 and not cam.luz_cambio
+
+
+def test_autoluz_respeta_el_negro_automatico_y_lo_que_la_camara_no_tiene():
+    cam = _CamaraConPisoBajoCero(Config(demo=True))
+    cam.valores["negro_auto"] = True
+    assert "negro auto" in cam.autoajustar_luz()
+    assert cam.valores["negro"] == 0
+    cam = _CamaraConPisoBajoCero(Config(demo=True))
+    cam.cap["negro_offset"] = False
+    cam.autoajustar_luz()
+    assert cam.valores["negro"] == 0
+
+
+def test_autoluz_avisa_si_el_negro_no_alcanza():
+    cam = DemoCamera(Config(demo=True))
+    img = _flat(200, 64, 64)
+    img[20:] = 0                                    # esta zona no sube con ningun offset
+    cam.grab = lambda: img
+    assert "Sigue recortado" in cam.autoajustar_luz()
+    assert cam.valores["negro"] == NEGRO_MAX
+
+
+def test_una_imagen_saturada_se_ve_blanca_y_no_negra():
+    disp, k = imagen_de_pantalla(_flat(255.0), True)
+    assert k == 1.0 and disp.min() == 255
+    # Parte saturada y parte tenue: se muestra tal cual, sin estirar.
+    img = np.full((40, 40, 3), 20.0)
+    img[:, 20:] = 255.0
+    disp, k = imagen_de_pantalla(img, True)
+    assert k == 1.0 and disp[:, :20].max() == 20 and disp[:, 20:].min() == 255
+
+
+def test_realce_no_convierte_el_ruido_en_imagen():
+    ruido = np.random.default_rng(0).normal(5.0, 0.3, (200, 200, 3))
+    assert imagen_de_pantalla(ruido, True)[1] == REALCE_MAX
+    assert imagen_de_pantalla(_flat(0.0), True)[1] == REALCE_MAX
+
+
+def test_sin_realce_la_pantalla_es_la_imagen_tal_cual():
+    img = np.full((16, 32, 3), 300.0)
+    img[0, 0] = -5.0
+    disp, k = imagen_de_pantalla(img, False)
+    assert k == 1.0 and disp.max() == 255 and disp.min() == 0
+
+
+def test_el_realce_no_toca_el_frame_que_se_mide():
+    img = _flat(10.0)
+    copia = img.copy()
+    imagen_de_pantalla(img, True)
+    assert np.array_equal(img, copia)
+
+
+def test_ultimos_ajustes_ida_y_vuelta(tmp_path):
+    ruta = tmp_path / "sub" / "u.json"
+    cam = DemoCamera(Config(demo=True))
+    cam.aplicar_ajuste("exposicion", 300.0)
+    cam.aplicar_ajuste("ganancia_r", 100)
+    guardar_ultimos(cam, False, ruta)
+    nueva = DemoCamera(Config(demo=True))
+    realce, aviso = restaurar_ultimos(nueva, Config(), ruta)
+    assert realce is False
+    assert nueva.exposure_ms == 300.0 and nueva.valores["ganancia_r"] == 100
+    assert "300.0 ms" in aviso and "r=100" in aviso     # lo cargado siempre se dice
+
+
+def test_ultimos_ajustes_no_restaura_trigger_ni_salidas(tmp_path):
+    ruta = tmp_path / "u.json"
+    cam = DemoCamera(Config(demo=True))
+    cam.valores["trigger_modo"] = "flanco de subida"
+    cam.valores["gpio1"] = "salida alta"
+    guardar_ultimos(cam, True, ruta)
+    guardados = json.loads(ruta.read_text(encoding="utf-8"))["ajustes"]
+    assert not [k for k in guardados if k.startswith(NO_RECORDAR)]
+    # Aunque el archivo los traiga, por ejemplo de una version anterior.
+    guardados["trigger_modo"] = "flanco de subida"
+    ruta.write_text(json.dumps({"ajustes": guardados}), encoding="utf-8")
+    nueva = DemoCamera(Config(demo=True))
+    restaurar_ultimos(nueva, Config(), ruta)
+    assert not nueva.valores["trigger_modo"].startswith("flanco")
+
+
+def test_las_opciones_explicitas_mandan_sobre_lo_recordado(tmp_path):
+    ruta = tmp_path / "u.json"
+    cam = DemoCamera(Config(demo=True))
+    cam.aplicar_ajuste("exposicion", 300.0)
+    guardar_ultimos(cam, False, ruta)
+    pedida = Config(demo=True, exposure_ms=5.0)
+    nueva = DemoCamera(pedida)
+    realce, aviso = restaurar_ultimos(nueva, pedida, ruta)
+    assert nueva.exposure_ms == 5.0 and aviso == "" and realce is False
+
+
+def test_un_archivo_de_ultimos_roto_no_impide_abrir(tmp_path):
+    ruta = tmp_path / "u.json"
+    cam = DemoCamera(Config(demo=True))
+    assert restaurar_ultimos(cam, Config(), ruta) == (True, "")    # no existe
+    for basura in ("{", "[]", '{"ajustes": 3}'):
+        ruta.write_text(basura, encoding="utf-8")
+        assert restaurar_ultimos(cam, Config(), ruta) == (True, "")
+    assert cam.exposure_ms == Config().exposure_ms
+
+
+def test_se_guarda_el_reloj_previo_a_alargar_la_exposicion():
+    # Con el reloj que bajo solo, una exposicion corta quedaria atrapada a 1 fps.
+    cam = DemoCamera(Config(demo=True))
+    cam.valores["pixel_clock"], cam.valores["fps"] = 5, 1.0
+    cam._tiempos_base = (24, 13.96, 71.5, 205.0)
+    v = _valores_a_guardar(cam)
+    assert (v["pixel_clock"], v["fps"]) == (24, 13.96)
+
+
+def test_ruta_de_ultimos_separa_cada_camara_y_no_aplica_a_la_demo():
+    assert ruta_ultimos(DemoCamera(Config(demo=True))) is None
+    class Cam:
+        driver, model, serie = "uc480", "C1280/R12C", "40 02"
+    assert ruta_ultimos(Cam()).name == "ultimos_C1280_R12C_40_02.json"
 
 
 def test_opciones_de_mascara_salen_de_lo_que_declara_la_camara():
